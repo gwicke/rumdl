@@ -217,13 +217,20 @@ where
     let s = String::deserialize(deserializer)?;
     let normalized = s.trim().to_ascii_lowercase().replace('_', "-");
 
-    let valid_styles = ["aligned", "aligned-no-space", "compact", "tight", "any"];
+    let valid_styles = [
+        "aligned",
+        "aligned-no-space",
+        "aligned-adaptive",
+        "compact",
+        "tight",
+        "any",
+    ];
 
     if valid_styles.contains(&normalized.as_str()) {
         Ok(normalized)
     } else {
         Err(serde::de::Error::custom(format!(
-            "Invalid table format style: {s}. Valid options: aligned, aligned-no-space, compact, tight, any"
+            "Invalid table format style: {s}. Valid options: aligned, aligned-no-space, aligned-adaptive, compact, tight, any"
         )))
     }
 }

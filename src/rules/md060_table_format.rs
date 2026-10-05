@@ -28,12 +28,35 @@ enum ColumnAlignment {
     Right,
 }
 
+/// How far the formatter had to go to keep a table inside `max-width`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Degradation {
+    /// The table is aligned and fits.
+    None,
+    /// The table is aligned, but only with its padding removed.
+    PaddingRemoved,
+    /// Nothing aligned fits, so the table had to give up alignment.
+    /// `aligned_width` is how wide the fully aligned table would have been,
+    /// which is what the plain aligned styles report for every changed row.
+    TooWide { aligned_width: usize },
+}
+
 #[derive(Debug, Clone)]
 struct TableFormatResult {
     lines: Vec<String>,
-    auto_compacted: bool,
-    aligned_width: Option<usize>,
+    degradation: Degradation,
 }
+
+/// Spaces on each side of a cell's content in the aligned styles.
+const ALIGNED_PAD_WIDTH: usize = 1;
+
+/// `aligned-adaptive` always drops that padding first, so any layout it settles
+/// on — and the per-row compaction that follows — is written without it.
+const ADAPTIVE_PAD_WIDTH: usize = 0;
+
+/// The narrowest a delimiter cell may be: GFM wants three dashes, and
+/// `:---` / `---:` need room for their colons on top of that.
+const MIN_DELIMITER_CELL_WIDTH: usize = 3;
 
 /// Formatting options for a single table row.
 #[derive(Debug, Clone, Copy)]
@@ -42,12 +65,99 @@ struct RowFormatOptions {
     row_type: RowType,
     /// Whether to use compact delimiter style (no spaces around dashes)
     compact_delimiter: bool,
+    /// Spaces on each side of the cell's content
+    pad_width: usize,
     /// Global column alignment override
     column_align: ColumnAlign,
     /// Header-specific column alignment (overrides column_align for header)
     column_align_header: Option<ColumnAlign>,
     /// Body-specific column alignment (overrides column_align for body)
     column_align_body: Option<ColumnAlign>,
+}
+
+/// How the last column's width is chosen before any width limit applies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LastColumn {
+    /// Pad the last column out to its widest cell.
+    Widest,
+    /// Cap the last column at the header's width: narrower cells pad to the
+    /// header, wider ones overflow it. This is `loose-last-column`.
+    Header,
+}
+
+/// What a table's content measures, which is everything an aligned layout is
+/// decided from.
+#[derive(Debug, Clone, PartialEq)]
+struct ColumnLayout {
+    /// Each column's width: its widest cell, never narrower than the floor its
+    /// delimiter row imposes.
+    widths: Vec<usize>,
+    /// How narrow each column may get while its delimiter row stays valid.
+    floors: Vec<usize>,
+    /// The narrowest cell in the last column. Once the last column is
+    /// squeezed to fit, this is what the shortest row still has to render.
+    narrowest_last_width: usize,
+}
+
+impl ColumnLayout {
+    /// The widths to use when `limit` leaves no room for the last column at its
+    /// measured width: every other column stays as it is and the last one takes
+    /// what is left, down to the width its delimiter row needs.
+    ///
+    /// Cells longer than that width still render at their own length, so rows
+    /// can overflow `limit` even though the columns line up.
+    fn with_last_column_fitted(&self, pad_width: usize, limit: usize) -> Vec<usize> {
+        let mut widths = self.widths.clone();
+        let Some(last) = widths.len().checked_sub(1) else {
+            return widths;
+        };
+
+        let available = limit.saturating_sub(MD060TableFormat::fixed_row_width(pad_width, &self.widths));
+        widths[last] = available.max(self.floors[last]).min(self.widths[last]);
+
+        widths
+    }
+
+    /// The widths to use when even the natural ones do not fit: columns keep
+    /// their natural widths from the left, and only what the budget has left
+    /// after the columns to the right have their floors goes to the columns
+    /// further right. The leftmost columns therefore never shift while there
+    /// is any room at all; the reduction is felt right-to-left.
+    ///
+    /// `None` when the columns cannot be narrowed enough to fit, which is the
+    /// one case where what a cell holds is wider than the limit can be.
+    fn scaled_to_fit(&self, pad_width: usize, limit: usize) -> Option<Vec<usize>> {
+        let floor_total: usize = self.floors.iter().sum();
+        let mut budget = limit.checked_sub(MD060TableFormat::pipes_and_padding(self.widths.len(), pad_width))?;
+        if budget < floor_total {
+            return None;
+        }
+
+        // Every column still gets at least its delimiter row's minimum; a
+        // column takes as much of its natural width as the budget can carry
+        // once the columns to its right are reserved at theirs.
+        let mut widths = Vec::with_capacity(self.widths.len());
+        for i in 0..self.widths.len() {
+            let reserved: usize = self.floors[i + 1..].iter().sum();
+            let take = self.widths[i].min(budget - reserved);
+            widths.push(take);
+            budget -= take;
+        }
+
+        Some(widths)
+    }
+}
+
+/// The layout an aligned table gets, or the decision to stop aligning it.
+#[derive(Debug, Clone, PartialEq)]
+enum AlignmentPlan {
+    /// Columns aligned, with `pad_width` spaces on each side of every cell.
+    Aligned {
+        pad_width: usize,
+        column_widths: Vec<usize>,
+    },
+    /// Nothing aligned fits within the limit.
+    Compact,
 }
 
 /// Rule MD060: Table Column Alignment
@@ -82,9 +192,27 @@ struct RowFormatOptions {
 /// ### Style Options
 ///
 /// - **aligned**: Columns are padded with spaces for visual alignment (default)
+/// - **aligned-no-space**: Like `aligned`, but the delimiter row has no padding
+/// - **aligned-adaptive**: `aligned` that gives up padding, then the last
+///   column, before it gives up alignment (see below)
 /// - **compact**: Minimal spacing with single spaces
 /// - **tight**: No spacing, pipes directly adjacent to content
 /// - **any**: Preserve existing formatting style
+///
+/// ### Aligned Adaptive
+///
+/// `aligned-adaptive` keeps the most aligned layout that still fits
+/// `max-width`: aligned with its padding, then aligned without it, and best
+/// effort once neither fits. The columns keep their natural widths from the
+/// left — only the columns further right give way — so the header and delimiter
+/// rows fill the limit without the leftmost columns shifting. Any row that is
+/// still too wide gives up the width of its rightmost cells until it fits, or
+/// comes out compact when its own content leaves nothing to give. With
+/// `loose-last-column`, a table that fits keeps its last column at its natural
+/// width; once rows run past the limit that column is widened to fill the
+/// remaining budget instead of collapsed to the header, and only when every row
+/// is too wide does the row-wise compaction begin. See docs/md060.md for
+/// examples.
 ///
 /// ### Max Width (auto-compact threshold)
 ///
@@ -331,15 +459,25 @@ impl MD060TableFormat {
             .collect()
     }
 
-    fn calculate_column_widths(
+    /// Measure a table's columns: how wide each one has to be, how narrow it
+    /// may get while its delimiter row stays valid, and how short the last
+    /// column's narrowest cell is.
+    ///
+    /// `last_column` decides the last column's width for layouts that settle it
+    /// before any width limit applies; `aligned-adaptive` measures the
+    /// widest widths and does its own budgeting later.
+    fn measure_columns(
         table_lines: &[&str],
         flavor: crate::config::MarkdownFlavor,
-        loose_last_column: bool,
-    ) -> Vec<usize> {
-        let mut column_widths = Vec::new();
+        last_column: LastColumn,
+    ) -> ColumnLayout {
+        let mut natural_widths: Vec<usize> = Vec::new();
         let mut delimiter_cells: Option<Vec<String>> = None;
         let mut is_header = true;
         let mut header_last_col_width: Option<usize> = None;
+        // (cells in the row, width of that row's last cell), collected per row
+        // so rows that do not reach the last column are left out below.
+        let mut last_cell_widths: Vec<(usize, usize)> = Vec::new();
 
         for line in table_lines {
             let cells = Self::parse_table_row_with_flavor(line, flavor);
@@ -353,11 +491,15 @@ impl MD060TableFormat {
 
             for (i, cell) in cells.iter().enumerate() {
                 let width = Self::calculate_cell_display_width(cell);
-                if i >= column_widths.len() {
-                    column_widths.push(width);
+                if i >= natural_widths.len() {
+                    natural_widths.push(width);
                 } else {
-                    column_widths[i] = column_widths[i].max(width);
+                    natural_widths[i] = natural_widths[i].max(width);
                 }
+            }
+
+            if let Some(last) = cells.last() {
+                last_cell_widths.push((cells.len(), Self::calculate_cell_display_width(last)));
             }
 
             // Record the header row's last column width
@@ -369,35 +511,103 @@ impl MD060TableFormat {
         }
 
         // When loose, cap the last column width at the header's width
-        if loose_last_column
+        if last_column == LastColumn::Header
             && let Some(header_width) = header_last_col_width
-            && let Some(last) = column_widths.last_mut()
+            && let Some(last) = natural_widths.last_mut()
         {
             *last = header_width;
         }
 
         // GFM requires delimiter rows to have at least 3 dashes per column.
         // To ensure visual alignment, all columns must be at least width 3.
-        let mut final_widths: Vec<usize> = column_widths.iter().map(|&w| w.max(3)).collect();
-
-        // Adjust column widths to accommodate alignment indicators (colons) in delimiter row
-        // This ensures the delimiter row has the same length as content rows
+        // Alignment indicators (colons) need room on top of that, and the
+        // delimiter row has to come out the same length as the content rows.
+        let mut floors = vec![MIN_DELIMITER_CELL_WIDTH; natural_widths.len()];
         if let Some(delimiter_cells) = delimiter_cells {
             for (i, cell) in delimiter_cells.iter().enumerate() {
-                if i < final_widths.len() {
+                if i < floors.len() {
                     let trimmed = cell.trim();
                     let has_left_colon = trimmed.starts_with(':');
                     let has_right_colon = trimmed.ends_with(':');
                     let colon_count = (has_left_colon as usize) + (has_right_colon as usize);
 
                     // Minimum width needed: 3 dashes + colons
-                    let min_width_for_delimiter = 3 + colon_count;
-                    final_widths[i] = final_widths[i].max(min_width_for_delimiter);
+                    floors[i] = floors[i].max(MIN_DELIMITER_CELL_WIDTH + colon_count);
                 }
             }
         }
 
-        final_widths
+        let widths: Vec<usize> = natural_widths
+            .iter()
+            .zip(&floors)
+            .map(|(&natural, &floor)| natural.max(floor))
+            .collect();
+
+        // Only rows reaching the last column tell us how short it can render.
+        let narrowest_last_width = last_cell_widths
+            .iter()
+            .filter(|(cells, _)| *cells == widths.len())
+            .map(|(_, width)| *width)
+            .min()
+            .unwrap_or(0);
+
+        ColumnLayout {
+            widths,
+            floors,
+            narrowest_last_width,
+        }
+    }
+
+    fn calculate_column_widths(
+        table_lines: &[&str],
+        flavor: crate::config::MarkdownFlavor,
+        loose_last_column: bool,
+    ) -> Vec<usize> {
+        Self::measure_columns(
+            table_lines,
+            flavor,
+            if loose_last_column {
+                LastColumn::Header
+            } else {
+                LastColumn::Widest
+            },
+        )
+        .widths
+    }
+
+    /// The most aligned layout that still fits `limit`, giving things up one
+    /// step at a time: the padding, then — when `loose-last-column` lets the
+    /// last column give way — the last column itself, and alignment only once
+    /// the table's shortest row does not fit either way.
+    fn plan_aligned(layout: &ColumnLayout, limit: usize, loose_last_column: bool) -> AlignmentPlan {
+        // A fully aligned table fits: pad it the way `aligned` does. This is
+        // also what keeps `loose-last-column` a no-op for tables that are
+        // narrow enough, since it only ever matters once a row runs long.
+        for pad_width in [ALIGNED_PAD_WIDTH, 0] {
+            if Self::row_width(pad_width, &layout.widths, layout.narrowest_last_width) <= limit {
+                return AlignmentPlan::Aligned {
+                    pad_width,
+                    column_widths: layout.widths.clone(),
+                };
+            }
+        }
+
+        // The padding has gone and the table still does not fit, so the last
+        // column takes whatever the limit leaves over. Padding is already
+        // spent at this point, so this step keeps no padding either: a row whose
+        // own content is too long overflows on its own, while every other row
+        // lands on the limit.
+        if loose_last_column {
+            let column_widths = layout.with_last_column_fitted(0, limit);
+            if Self::row_width(0, &column_widths, layout.narrowest_last_width) <= limit {
+                return AlignmentPlan::Aligned {
+                    pad_width: 0,
+                    column_widths,
+                };
+            }
+        }
+
+        AlignmentPlan::Compact
     }
 
     fn format_table_row(
@@ -406,6 +616,7 @@ impl MD060TableFormat {
         column_alignments: &[ColumnAlignment],
         options: &RowFormatOptions,
     ) -> String {
+        let pad = " ".repeat(options.pad_width);
         let formatted_cells: Vec<String> = cells
             .iter()
             .enumerate()
@@ -419,9 +630,14 @@ impl MD060TableFormat {
                         let has_right_colon = trimmed.ends_with(':');
 
                         // Delimiter rows use the same cell format as content rows: | content |
-                        // The "content" is dashes, possibly with colons for alignment
-                        // For compact_delimiter mode, we don't add spaces, so we need 2 extra dashes
-                        let extra_width = if options.compact_delimiter { 2 } else { 0 };
+                        // The "content" is dashes, possibly with colons for alignment.
+                        // compact_delimiter spends no padding on spaces around the dashes,
+                        // so the width the content rows spend on padding goes to dashes.
+                        let extra_width = if options.compact_delimiter {
+                            2 * options.pad_width
+                        } else {
+                            0
+                        };
                         let dash_count = if has_left_colon && has_right_colon {
                             (target_width + extra_width).saturating_sub(2)
                         } else if has_left_colon || has_right_colon {
@@ -430,7 +646,7 @@ impl MD060TableFormat {
                             target_width + extra_width
                         };
 
-                        let dashes = "-".repeat(dash_count.max(3)); // Minimum 3 dashes
+                        let dashes = "-".repeat(dash_count.max(MIN_DELIMITER_CELL_WIDTH)); // Minimum 3 dashes
                         let delimiter_content = if has_left_colon && has_right_colon {
                             format!(":{dashes}:")
                         } else if has_left_colon {
@@ -441,11 +657,11 @@ impl MD060TableFormat {
                             dashes
                         };
 
-                        // Add spaces around delimiter content unless compact_delimiter mode
+                        // Add padding around delimiter content unless compact_delimiter mode
                         if options.compact_delimiter {
                             delimiter_content
                         } else {
-                            format!(" {delimiter_content} ")
+                            format!("{pad}{delimiter_content}{pad}")
                         }
                     }
                     RowType::Header | RowType::Body => {
@@ -471,17 +687,21 @@ impl MD060TableFormat {
                         match alignment {
                             ColumnAlignment::Left => {
                                 // Left: content on left, padding on right
-                                format!(" {trimmed}{} ", " ".repeat(padding))
+                                format!("{pad}{trimmed}{}{pad}", " ".repeat(padding))
                             }
                             ColumnAlignment::Center => {
                                 // Center: split padding on both sides
                                 let left_padding = padding / 2;
                                 let right_padding = padding - left_padding;
-                                format!(" {}{trimmed}{} ", " ".repeat(left_padding), " ".repeat(right_padding))
+                                format!(
+                                    "{pad}{}{trimmed}{}{pad}",
+                                    " ".repeat(left_padding),
+                                    " ".repeat(right_padding)
+                                )
                             }
                             ColumnAlignment::Right => {
                                 // Right: padding on left, content on right
-                                format!(" {}{trimmed} ", " ".repeat(padding))
+                                format!("{pad}{}{trimmed}{pad}", " ".repeat(padding))
                             }
                         }
                     }
@@ -490,6 +710,38 @@ impl MD060TableFormat {
             .collect();
 
         format!("|{}|", formatted_cells.join("|"))
+    }
+
+    /// The widths a row uses when it is too wide for `column_widths`: it gives
+    /// up the padding of its rightmost cells first, so a row that is only
+    /// slightly over keeps the alignment of its left columns. A cell holding
+    /// more than its column has no padding to give and stays as it is, and a row
+    /// with nothing left to give ends up wider than the limit regardless.
+    fn fitted_row_widths(cells: &[String], column_widths: &[usize], pad_width: usize, limit: usize) -> Vec<usize> {
+        let content_widths: Vec<usize> = cells
+            .iter()
+            .map(|cell| Self::calculate_cell_display_width(cell))
+            .collect();
+
+        let mut row_widths: Vec<usize> = column_widths
+            .iter()
+            .zip(&content_widths)
+            .map(|(&width, &content)| width.max(content))
+            .collect();
+        let mut excess =
+            MD060TableFormat::pipes_and_padding(row_widths.len(), pad_width) + row_widths.iter().sum::<usize>() - limit;
+
+        for i in (0..row_widths.len()).rev() {
+            if excess == 0 {
+                break;
+            }
+            let giveable = row_widths[i] - content_widths[i];
+            let given = giveable.min(excess);
+            row_widths[i] -= given;
+            excess -= given;
+        }
+
+        row_widths
     }
 
     fn format_table_compact(cells: &[String]) -> String {
@@ -559,6 +811,32 @@ impl MD060TableFormat {
             .collect()
     }
 
+    /// The width `n` columns spend on their pipes and the padding around each
+    /// cell, whatever the cells hold.
+    fn pipes_and_padding(num_columns: usize, pad_width: usize) -> usize {
+        1 + num_columns * (2 * pad_width + 1)
+    }
+
+    /// The width of a row's pipes, its padding, and every column but the last:
+    /// the part of the row a layout fixes however wide the last column gets.
+    fn fixed_row_width(pad_width: usize, column_widths: &[usize]) -> usize {
+        let content: usize = column_widths.iter().sum();
+        let last = column_widths.last().copied().unwrap_or(0);
+        1 + column_widths.len() * (2 * pad_width + 1) + content - last
+    }
+
+    /// The width of the narrowest row a layout can produce, which is what has
+    /// to stay within `max-width` for the table to be worth aligning.
+    ///
+    /// Every row is this wide while each column holds its widest cell, because
+    /// shorter cells are padded out to it. Once the last column has been
+    /// squeezed to fit, a cell longer than its column overflows instead, so the
+    /// rows grow past this width while the shortest one stays at it.
+    fn row_width(pad_width: usize, column_widths: &[usize], narrowest_last_width: usize) -> usize {
+        let last = column_widths.last().copied().unwrap_or(0);
+        Self::fixed_row_width(pad_width, column_widths) + last.max(narrowest_last_width)
+    }
+
     /// Checks if a table is already aligned with consistent column widths
     /// and the delimiter row style matches the target style.
     ///
@@ -566,14 +844,15 @@ impl MD060TableFormat {
     /// 1. All rows have the same display length
     /// 2. Each column has consistent cell width across all rows
     /// 3. The delimiter row has valid minimum widths (at least 3 chars per cell)
-    /// 4. The delimiter row style matches the target style (compact_delimiter parameter)
+    /// 4. The delimiter row carries exactly the padding the target style writes
     ///
     /// The `compact_delimiter` parameter indicates whether the target style is "aligned-no-space"
-    /// (true = no spaces around dashes, false = spaces around dashes).
+    /// (true = no padding around dashes) or "aligned" (false = `pad_width` spaces around dashes).
     fn is_table_already_aligned(
         table_lines: &[&str],
         flavor: crate::config::MarkdownFlavor,
         compact_delimiter: bool,
+        pad_width: usize,
     ) -> bool {
         if table_lines.len() < 2 {
             return false;
@@ -620,19 +899,34 @@ impl MD060TableFormat {
                 }
             }
 
-            // Check if delimiter row style matches the target style
-            // compact_delimiter=true means "aligned-no-space" (no spaces around dashes)
-            // compact_delimiter=false means "aligned" (spaces around dashes)
-            let delimiter_has_spaces = delimiter_row
-                .iter()
-                .all(|cell| cell.starts_with(' ') && cell.ends_with(' '));
+            // Check the delimiter row carries the padding the target style writes:
+            // compact_delimiter=true means "aligned-no-space" (no padding around dashes),
+            // compact_delimiter=false means "aligned" (`pad_width` spaces around dashes).
+            let delimiter_padded_as_targeted = if pad_width == ALIGNED_PAD_WIDTH {
+                // The plain aligned styles accept any padding around the dashes
+                // as "padded", the way they always have; the widths of the rows
+                // catch the rest.
+                let delimiter_has_spaces = delimiter_row
+                    .iter()
+                    .all(|cell| cell.starts_with(' ') && cell.ends_with(' '));
+                if compact_delimiter {
+                    !delimiter_has_spaces
+                } else {
+                    delimiter_has_spaces
+                }
+            } else {
+                // `aligned-adaptive` with its padding dropped: the delimiter
+                // must carry none, counted exactly, or the row is not the one
+                // the target style writes.
+                delimiter_row.iter().all(|cell| {
+                    // Padding is ASCII, so byte length and character count agree.
+                    let leading = cell.len() - cell.trim_start().len();
+                    let trailing = cell.len() - cell.trim_end().len();
+                    leading == pad_width && trailing == pad_width
+                })
+            };
 
-            // If target is compact (no spaces) but current has spaces, not aligned
-            // If target is spaced but current has no spaces, not aligned
-            if compact_delimiter && delimiter_has_spaces {
-                return false;
-            }
-            if !compact_delimiter && !delimiter_has_spaces {
+            if !delimiter_padded_as_targeted {
                 return false;
             }
         }
@@ -769,8 +1063,7 @@ impl MD060TableFormat {
         flavor: crate::config::MarkdownFlavor,
     ) -> TableFormatResult {
         let mut result = Vec::new();
-        let mut auto_compacted = false;
-        let mut aligned_width = None;
+        let mut degradation = Degradation::None;
 
         let table_lines: Vec<&str> = std::iter::once(lines[table_block.header_line])
             .chain(std::iter::once(lines[table_block.delimiter_line]))
@@ -780,8 +1073,7 @@ impl MD060TableFormat {
         if table_lines.iter().any(|line| Self::contains_problematic_chars(line)) {
             return TableFormatResult {
                 lines: table_lines.iter().map(std::string::ToString::to_string).collect(),
-                auto_compacted: false,
-                aligned_width: None,
+                degradation: Degradation::None,
             };
         }
 
@@ -836,8 +1128,7 @@ impl MD060TableFormat {
                 if detected_style.is_none() {
                     return TableFormatResult {
                         lines: table_lines.iter().map(std::string::ToString::to_string).collect(),
-                        auto_compacted: false,
-                        aligned_width: None,
+                        degradation: Degradation::None,
                     };
                 }
 
@@ -863,6 +1154,7 @@ impl MD060TableFormat {
                             let options = RowFormatOptions {
                                 row_type,
                                 compact_delimiter: false,
+                                pad_width: ALIGNED_PAD_WIDTH,
                                 column_align: self.config.column_align,
                                 column_align_header: self.config.column_align_header,
                                 column_align_body: self.config.column_align_body,
@@ -901,88 +1193,204 @@ impl MD060TableFormat {
                     });
                 }
             }
-            "aligned" | "aligned-no-space" => {
+            "aligned" | "aligned-no-space" | "aligned-adaptive" => {
                 let compact_delimiter = style == "aligned-no-space";
+                // `aligned-adaptive` picks a layout per table from the width
+                // budget; the plain aligned styles have one layout and switch to
+                // compact outright when it does not fit.
+                let auto = style == "aligned-adaptive";
+                let limit = self.effective_max_width();
 
-                // Determine if we need to reformat: skip if table is already aligned
-                // UNLESS any alignment or formatting options require reformatting
+                let layout = Self::measure_columns(
+                    &stripped_lines,
+                    flavor,
+                    // The auto style always measures the widest columns: a table
+                    // that fits keeps them, however `loose-last-column` would
+                    // otherwise narrow its last column.
+                    match (auto, self.config.loose_last_column) {
+                        (true, _) | (false, false) => LastColumn::Widest,
+                        (false, true) => LastColumn::Header,
+                    },
+                );
+
+                // Whether alignment or formatting options require reformatting
+                // even when the table is already aligned.
                 let needs_reformat = self.config.column_align != ColumnAlign::Auto
                     || self.config.column_align_header.is_some()
                     || self.config.column_align_body.is_some()
                     || self.config.loose_last_column;
 
-                if !needs_reformat && Self::is_table_already_aligned(&stripped_lines, flavor, compact_delimiter) {
-                    return TableFormatResult {
-                        lines: table_lines.iter().map(std::string::ToString::to_string).collect(),
-                        auto_compacted: false,
-                        aligned_width: None,
-                    };
-                }
-
-                let column_widths =
-                    Self::calculate_column_widths(&stripped_lines, flavor, self.config.loose_last_column);
-
-                // Calculate aligned table width: 1 (leading pipe) + num_columns * 3 (| cell |) + sum(column_widths)
-                let num_columns = column_widths.len();
-                let calc_aligned_width = 1 + (num_columns * 3) + column_widths.iter().sum::<usize>();
-                aligned_width = Some(calc_aligned_width);
-
-                // Auto-compact: if aligned table exceeds max width, use compact formatting instead.
-                // The effective output style is now `compact`, so honor `aligned-delimiter`
-                // exactly as the explicit `compact` style does: align the delimiter row's pipes
-                // to the header column widths while body rows stay compact.
-                if calc_aligned_width > self.effective_max_width() {
-                    auto_compacted = true;
-                    let header_widths = if self.config.aligned_delimiter && stripped_lines.len() >= 2 {
-                        let header_cells = Self::parse_table_row_with_flavor(stripped_lines[0], flavor);
-                        Some(Self::header_cell_widths(&header_cells))
-                    } else {
-                        None
-                    };
-                    for (row_idx, line) in stripped_lines.iter().enumerate() {
-                        let cells = Self::parse_table_row_with_flavor(line, flavor);
-                        if row_idx == 1
-                            && let Some(widths) = &header_widths
-                        {
-                            // Auto-compact always produces the single-space compact form.
-                            result.push(Self::format_delimiter_aligned_to_header(&cells, widths, true));
-                            continue;
-                        }
-                        result.push(Self::format_table_compact(&cells));
-                    }
+                let plan = if auto {
+                    Self::plan_aligned(&layout, limit, self.config.loose_last_column)
                 } else {
-                    // Parse column alignments from delimiter row (always at index 1)
-                    let delimiter_cells = Self::parse_table_row_with_flavor(stripped_lines[1], flavor);
-                    let column_alignments = Self::parse_column_alignments(&delimiter_cells);
+                    // The plain styles leave a table that is already in the
+                    // target shape alone, even when it does not fit the width
+                    // limit: the limit picks the layout, it does not force one.
+                    if !needs_reformat
+                        && Self::is_table_already_aligned(&stripped_lines, flavor, compact_delimiter, ALIGNED_PAD_WIDTH)
+                    {
+                        return TableFormatResult {
+                            lines: table_lines.iter().map(std::string::ToString::to_string).collect(),
+                            degradation: Degradation::None,
+                        };
+                    }
 
-                    for (row_idx, line) in stripped_lines.iter().enumerate() {
-                        let cells = Self::parse_table_row_with_flavor(line, flavor);
-                        let row_type = match row_idx {
-                            0 => RowType::Header,
-                            1 => RowType::Delimiter,
-                            _ => RowType::Body,
+                    if Self::row_width(ALIGNED_PAD_WIDTH, &layout.widths, layout.narrowest_last_width) > limit {
+                        AlignmentPlan::Compact
+                    } else {
+                        AlignmentPlan::Aligned {
+                            pad_width: ALIGNED_PAD_WIDTH,
+                            column_widths: layout.widths.clone(),
+                        }
+                    }
+                };
+
+                match plan {
+                    // Nothing aligned fits. The plain styles write compact
+                    // formatting, honoring `aligned-delimiter` exactly as the
+                    // explicit `compact` style does; the adaptive style keeps
+                    // as much alignment as the limit allows.
+                    AlignmentPlan::Compact => {
+                        degradation = Degradation::TooWide {
+                            aligned_width: Self::row_width(
+                                ALIGNED_PAD_WIDTH,
+                                &layout.widths,
+                                layout.narrowest_last_width,
+                            ),
                         };
-                        let options = RowFormatOptions {
-                            row_type,
-                            compact_delimiter,
-                            column_align: self.config.column_align,
-                            column_align_header: self.config.column_align_header,
-                            column_align_body: self.config.column_align_body,
-                        };
-                        result.push(Self::format_table_row(
-                            &cells,
-                            &column_widths,
-                            &column_alignments,
-                            &options,
-                        ));
+                        if auto {
+                            // The columns start at the header's needs, scaled
+                            // down from the left if even those do not fit, and
+                            // the header then fixes the widths the delimiter
+                            // row and every content row follow. A content row
+                            // that is still too wide gives up the width of its
+                            // rightmost cells until it fits or has nothing left
+                            // to give.
+                            let column_alignments = Self::parse_column_alignments(&Self::parse_table_row_with_flavor(
+                                stripped_lines[1],
+                                flavor,
+                            ));
+                            let header_cells = Self::parse_table_row_with_flavor(stripped_lines[0], flavor);
+                            let column_widths = layout
+                                .scaled_to_fit(ADAPTIVE_PAD_WIDTH, limit)
+                                .unwrap_or_else(|| layout.floors.clone());
+                            let column_widths =
+                                Self::fitted_row_widths(&header_cells, &column_widths, ADAPTIVE_PAD_WIDTH, limit);
+
+                            for (row_idx, line) in stripped_lines.iter().enumerate() {
+                                let cells = Self::parse_table_row_with_flavor(line, flavor);
+                                let row_type = match row_idx {
+                                    0 => RowType::Header,
+                                    1 => RowType::Delimiter,
+                                    _ => RowType::Body,
+                                };
+                                let options = RowFormatOptions {
+                                    row_type,
+                                    compact_delimiter: false,
+                                    pad_width: ADAPTIVE_PAD_WIDTH,
+                                    column_align: self.config.column_align,
+                                    column_align_header: self.config.column_align_header,
+                                    column_align_body: self.config.column_align_body,
+                                };
+
+                                // The delimiter fills the widths the header settled
+                                // on, so it is written to them rather than trimmed;
+                                // a content row keeps its own padding only for as
+                                // long as it fits. The dropped padding applies to the
+                                // delimiter row too, so `aligned-delimiter` keeps its
+                                // pipes on the header's without re-padding the dashes.
+                                let row_widths = match row_type {
+                                    RowType::Header | RowType::Delimiter => column_widths.clone(),
+                                    RowType::Body => {
+                                        Self::fitted_row_widths(&cells, &column_widths, ADAPTIVE_PAD_WIDTH, limit)
+                                    }
+                                };
+                                result.push(Self::format_table_row(
+                                    &cells,
+                                    &row_widths,
+                                    &column_alignments,
+                                    &options,
+                                ));
+                            }
+                        } else {
+                            // The effective output style is now `compact`, so honor
+                            // `aligned-delimiter` exactly as the explicit `compact`
+                            // style does: align the delimiter row's pipes to the header
+                            // column widths while body rows stay compact.
+                            let header_widths = if self.config.aligned_delimiter && stripped_lines.len() >= 2 {
+                                let header_cells = Self::parse_table_row_with_flavor(stripped_lines[0], flavor);
+                                Some(Self::header_cell_widths(&header_cells))
+                            } else {
+                                None
+                            };
+                            for (row_idx, line) in stripped_lines.iter().enumerate() {
+                                let cells = Self::parse_table_row_with_flavor(line, flavor);
+                                if row_idx == 1
+                                    && let Some(widths) = &header_widths
+                                {
+                                    // Auto-compact always produces the single-space compact form.
+                                    result.push(Self::format_delimiter_aligned_to_header(&cells, widths, true));
+                                    continue;
+                                }
+                                result.push(Self::format_table_compact(&cells));
+                            }
+                        }
+                    }
+                    AlignmentPlan::Aligned {
+                        pad_width,
+                        column_widths,
+                    } => {
+                        if pad_width < ALIGNED_PAD_WIDTH {
+                            degradation = Degradation::PaddingRemoved;
+                        }
+
+                        // The adaptive style settles its layout first, so the
+                        // table is only left alone when it already sits on the
+                        // layout the plan picked — unless the options above
+                        // require reformatting either way.
+                        if auto
+                            && !needs_reformat
+                            && Self::is_table_already_aligned(&stripped_lines, flavor, compact_delimiter, pad_width)
+                        {
+                            return TableFormatResult {
+                                lines: table_lines.iter().map(std::string::ToString::to_string).collect(),
+                                degradation: Degradation::None,
+                            };
+                        }
+
+                        // Parse column alignments from delimiter row (always at index 1)
+                        let delimiter_cells = Self::parse_table_row_with_flavor(stripped_lines[1], flavor);
+                        let column_alignments = Self::parse_column_alignments(&delimiter_cells);
+
+                        for (row_idx, line) in stripped_lines.iter().enumerate() {
+                            let cells = Self::parse_table_row_with_flavor(line, flavor);
+                            let row_type = match row_idx {
+                                0 => RowType::Header,
+                                1 => RowType::Delimiter,
+                                _ => RowType::Body,
+                            };
+                            let options = RowFormatOptions {
+                                row_type,
+                                compact_delimiter,
+                                pad_width,
+                                column_align: self.config.column_align,
+                                column_align_header: self.config.column_align_header,
+                                column_align_body: self.config.column_align_body,
+                            };
+                            result.push(Self::format_table_row(
+                                &cells,
+                                &column_widths,
+                                &column_alignments,
+                                &options,
+                            ));
+                        }
                     }
                 }
             }
             _ => {
                 return TableFormatResult {
                     lines: table_lines.iter().map(std::string::ToString::to_string).collect(),
-                    auto_compacted: false,
-                    aligned_width: None,
+                    degradation: Degradation::None,
                 };
             }
         }
@@ -1010,8 +1418,7 @@ impl MD060TableFormat {
 
         TableFormatResult {
             lines: prefixed_result,
-            auto_compacted,
-            aligned_width,
+            degradation,
         }
     }
 }
@@ -1066,6 +1473,86 @@ impl Rule for MD060TableFormat {
             let table_replacement = fixed_table_lines.concat();
             let table_range = ctx.line_span_byte_range(table_start_line, table_end_line);
 
+            let max_width = self.effective_max_width();
+
+            if self.config.style == "aligned-adaptive" {
+                // For `aligned-adaptive`, warnings are per-row facts about the
+                // file as it stands right now:
+                //
+                // - a row over `max-width` always warns — a width violation is
+                //   what makes `fmt` (and Quick Fix) dispatch in the first
+                //   place, and it is always something the user can act on;
+                // - a row the formatter would change — ragged against the
+                //   target geometry, or carrying padding that has to go — warns
+                //   as misaligned, so the rewrite is never silent;
+                // - a row already in its final shape that is aligned to the
+                //   target geometry and within the limit warns about nothing.
+                //
+                // Once formatting has been applied the last case covers every
+                // row the formatter is happy with; only over-wide and compacted
+                // rows keep warning.
+                let geometry: Vec<usize> = Self::parse_table_row_with_flavor(&format_result.lines[0], ctx.flavor)
+                    .iter()
+                    .map(|cell| cell.width())
+                    .collect();
+
+                let table_changed = table_line_indices
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &line_idx)| lines[line_idx] != format_result.lines[i]);
+                let fix = table_changed.then(|| crate::rule::Fix::new(table_range.clone(), table_replacement.clone()));
+
+                for (i, &line_idx) in table_line_indices.iter().enumerate() {
+                    let original = lines[line_idx];
+                    let fixed = &format_result.lines[i];
+
+                    let line_width = UnicodeWidthStr::width(original);
+                    let over = line_width > max_width;
+                    let out_of_shape = original != fixed
+                        || Self::parse_table_row_with_flavor(original, ctx.flavor)
+                            .iter()
+                            .enumerate()
+                            .any(|(col, cell)| cell.width() != geometry.get(col).copied().unwrap_or(0));
+                    if !over && !out_of_shape {
+                        continue;
+                    }
+
+                    let (start_line, start_col, end_line, end_col) = calculate_line_range(line_idx + 1, original);
+
+                    let message = if !over {
+                        "Table columns should be aligned".to_string()
+                    } else {
+                        match format_result.degradation {
+                            Degradation::PaddingRemoved => format!(
+                                "Table too wide for aligned formatting ({line_width} chars > max-width: {max_width}), padding removed"
+                            ),
+                            _ => format!(
+                                "Table too wide for aligned formatting ({line_width} chars > max-width: {max_width})"
+                            ),
+                        }
+                    };
+
+                    // Each warning uses the same whole-table fix so Quick Fix
+                    // on any row formats the entire table; a row that only
+                    // complains about its width still has the fix that brings
+                    // the table back within the limit.
+                    warnings.push(LintWarning {
+                        rule_name: Some(self.name().to_string()),
+                        severity: Severity::Warning,
+                        message,
+                        line: start_line,
+                        column: start_col,
+                        end_line,
+                        end_column: end_col,
+                        fix: fix.clone(),
+                    });
+                }
+                continue;
+            }
+
+            // Other styles keep the behavior they have always had: every row
+            // the rewrite touches is reported, and a table that had to give up
+            // alignment reports the width the aligned table would have had.
             for (i, &line_idx) in table_line_indices.iter().enumerate() {
                 let original = lines[line_idx];
                 let fixed = &format_result.lines[i];
@@ -1073,18 +1560,11 @@ impl Rule for MD060TableFormat {
                 if original != fixed {
                     let (start_line, start_col, end_line, end_col) = calculate_line_range(line_idx + 1, original);
 
-                    let message = if format_result.auto_compacted {
-                        if let Some(width) = format_result.aligned_width {
-                            format!(
-                                "Table too wide for aligned formatting ({} chars > max-width: {})",
-                                width,
-                                self.effective_max_width()
-                            )
-                        } else {
-                            "Table too wide for aligned formatting".to_string()
-                        }
-                    } else {
-                        "Table columns should be aligned".to_string()
+                    let message = match format_result.degradation {
+                        Degradation::TooWide { aligned_width } => format!(
+                            "Table too wide for aligned formatting ({aligned_width} chars > max-width: {max_width})"
+                        ),
+                        _ => "Table columns should be aligned".to_string(),
                     };
 
                     // Each warning uses the same whole-table fix
@@ -1776,8 +2256,10 @@ mod tests {
         };
         let rule = MD060TableFormat::from_config_struct(config, md013_with_line_length(80), false);
 
-        // Table that will be auto-compacted (exceeds 50 chars when aligned)
-        let content = "| Very Long Column Header A | Very Long Column Header B | Very Long Column Header C |\n|---|---|---|\n| Data | Data | Data |";
+        // Table that will be auto-compacted (exceeds 50 chars when aligned). The
+        // header row is padded so compaction changes it: a row that is over the
+        // limit without changing has nothing to report.
+        let content = "| Very Long Column Header A   | Very Long Column Header B   | Very Long Column Header C   |\n|---|---|---|\n| Data | Data | Data |";
         let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
 
         let warnings = rule.check(&ctx).unwrap();
@@ -2158,7 +2640,7 @@ mod tests {
 
         // First check is raw line length equality (byte-based), which fails
         let is_aligned =
-            MD060TableFormat::is_table_already_aligned(&table_lines, crate::config::MarkdownFlavor::Standard, false);
+            MD060TableFormat::is_table_already_aligned(&table_lines, crate::config::MarkdownFlavor::Standard, false, 1);
         assert!(
             !is_aligned,
             "Table with uneven raw line lengths should NOT be considered aligned"
@@ -2613,7 +3095,7 @@ style = "aligned"
             "| 你好   | Test |",
         ];
 
-        let result = MD060TableFormat::is_table_already_aligned(&table_lines, MarkdownFlavor::Standard, false);
+        let result = MD060TableFormat::is_table_already_aligned(&table_lines, MarkdownFlavor::Standard, false, 1);
         assert!(
             result,
             "Table with CJK characters that is display-aligned should be recognized as aligned"
@@ -2895,5 +3377,132 @@ Cell 1     Cell 2
             let fixed_ctx = LintContext::new(&mdg, crate::config::MarkdownFlavor::MDG, None);
             assert_eq!(rule.fix(&fixed_ctx).unwrap(), mdg, "MD060 fix must converge");
         }
+    }
+
+    /// A two-column table whose rows are `| a | b |`, `| c | d |`. The last
+    /// column holds "Short" and "A very long note that runs on", so its widest
+    /// cell is 29 columns and its narrowest is 5.
+    const LOOSE_TABLE: &str = "| Name | Notes |\n|---|---|\n| A | Short |\n| B | A very long note that runs on |";
+
+    #[test]
+    fn test_plan_keeps_padding_when_the_table_fits() {
+        let layout = MD060TableFormat::measure_columns(
+            &LOOSE_TABLE.split('\n').collect::<Vec<_>>(),
+            crate::config::MarkdownFlavor::Standard,
+            LastColumn::Widest,
+        );
+
+        assert_eq!(
+            MD060TableFormat::plan_aligned(&layout, 100, false),
+            AlignmentPlan::Aligned {
+                pad_width: 1,
+                column_widths: vec![4, 29],
+            }
+        );
+    }
+
+    #[test]
+    fn test_plan_drops_padding_before_giving_up_alignment() {
+        // 40 columns padded, 36 unpadded.
+        let layout = MD060TableFormat::measure_columns(
+            &LOOSE_TABLE.split('\n').collect::<Vec<_>>(),
+            crate::config::MarkdownFlavor::Standard,
+            LastColumn::Widest,
+        );
+
+        assert_eq!(
+            MD060TableFormat::plan_aligned(&layout, 36, false),
+            AlignmentPlan::Aligned {
+                pad_width: 0,
+                column_widths: vec![4, 29],
+            }
+        );
+        assert_eq!(
+            MD060TableFormat::plan_aligned(&layout, 35, false),
+            AlignmentPlan::Compact
+        );
+    }
+
+    #[test]
+    fn test_plan_budgets_the_last_column_only_when_loose() {
+        // Only the last column may give way, and only once the padding has
+        // already gone.
+        let layout = MD060TableFormat::measure_columns(
+            &LOOSE_TABLE.split('\n').collect::<Vec<_>>(),
+            crate::config::MarkdownFlavor::Standard,
+            LastColumn::Widest,
+        );
+
+        assert_eq!(
+            MD060TableFormat::plan_aligned(&layout, 30, true),
+            AlignmentPlan::Aligned {
+                pad_width: 0,
+                column_widths: vec![4, 23],
+            },
+            "the padding goes first, then the last column takes the 23 columns left over"
+        );
+
+        assert_eq!(
+            MD060TableFormat::plan_aligned(&layout, 30, false),
+            AlignmentPlan::Compact,
+            "without loose-last-column the columns stand and the table compacts"
+        );
+    }
+
+    #[test]
+    fn test_plan_keeps_the_natural_last_column_when_the_table_fits() {
+        // A table that fits stays exactly as `aligned` would write it, however
+        // narrow `loose-last-column` would otherwise make its last column.
+        let layout = MD060TableFormat::measure_columns(
+            &LOOSE_TABLE.split('\n').collect::<Vec<_>>(),
+            crate::config::MarkdownFlavor::Standard,
+            LastColumn::Widest,
+        );
+
+        assert_eq!(
+            MD060TableFormat::plan_aligned(&layout, 45, true),
+            AlignmentPlan::Aligned {
+                pad_width: 1,
+                column_widths: vec![4, 29],
+            }
+        );
+    }
+
+    #[test]
+    fn test_plan_compacts_only_when_no_row_fits() {
+        // 10 columns leaves the last column at its delimiter floor, and the
+        // shortest row is still 16 wide: nothing aligned survives.
+        let layout = MD060TableFormat::measure_columns(
+            &LOOSE_TABLE.split('\n').collect::<Vec<_>>(),
+            crate::config::MarkdownFlavor::Standard,
+            LastColumn::Widest,
+        );
+
+        assert_eq!(
+            MD060TableFormat::plan_aligned(&layout, 10, true),
+            AlignmentPlan::Compact
+        );
+        assert_eq!(
+            MD060TableFormat::plan_aligned(&layout, 16, true),
+            AlignmentPlan::Aligned {
+                pad_width: 0,
+                column_widths: vec![4, 9],
+            },
+            "one column over the limit is enough to keep the table aligned"
+        );
+    }
+
+    #[test]
+    fn test_plan_never_narrows_a_column_below_its_delimiter() {
+        let layout = MD060TableFormat::measure_columns(
+            &LOOSE_TABLE.split('\n').collect::<Vec<_>>(),
+            crate::config::MarkdownFlavor::Standard,
+            LastColumn::Widest,
+        );
+
+        // The budget is negative here, but the delimiter row still needs three
+        // dashes, so the column floor holds.
+        let widths = layout.with_last_column_fitted(1, 1);
+        assert_eq!(widths, vec![4, MIN_DELIMITER_CELL_WIDTH]);
     }
 }

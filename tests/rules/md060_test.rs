@@ -3537,7 +3537,7 @@ fn md060_aligned_config_with_max_width(aligned_delimiter: bool, max_width: usize
 }
 
 #[test]
-fn test_md060_aligned_autocompact_honors_aligned_delimiter() {
+fn test_md060_aligned_adaptive_honors_aligned_delimiter() {
     // #646: when an `aligned` table exceeds max-width it auto-compacts. The effective output
     // style is then `compact`, so `aligned-delimiter = true` must align the delimiter row's
     // pipes to the header column widths, exactly as `style = "compact"` would.
@@ -3557,7 +3557,7 @@ fn test_md060_aligned_autocompact_honors_aligned_delimiter() {
 }
 
 #[test]
-fn test_md060_aligned_autocompact_without_aligned_delimiter_keeps_minimal_dashes() {
+fn test_md060_aligned_adaptive_without_aligned_delimiter_keeps_minimal_dashes() {
     // Default (aligned-delimiter = false): auto-compact keeps the minimal compact delimiter.
     let config = md060_aligned_config_with_max_width(false, 40);
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
@@ -3574,7 +3574,7 @@ fn test_md060_aligned_autocompact_without_aligned_delimiter_keeps_minimal_dashes
 }
 
 #[test]
-fn test_md060_aligned_autocompact_aligned_delimiter_idempotent() {
+fn test_md060_aligned_adaptive_aligned_delimiter_idempotent() {
     // Running the fix twice on an auto-compacted + aligned-delimiter table must be stable.
     let config = md060_aligned_config_with_max_width(true, 40);
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
@@ -3689,4 +3689,691 @@ fn test_md060_compact_fix_is_idempotent() {
         warnings.is_empty(),
         "fixed output must not re-trigger MD060, got: {warnings:?}"
     );
+}
+
+// ============================================================================
+// ALIGNED-AUTOCOMPACT STYLE TESTS
+// ============================================================================
+
+fn adaptive_config(max_width: usize, loose_last_column: bool) -> MD060Config {
+    MD060Config {
+        enabled: true,
+        style: "aligned-adaptive".to_string(),
+        max_width: LineLength::from_const(max_width),
+        column_align: ColumnAlign::Auto,
+        column_align_header: None,
+        column_align_body: None,
+        loose_last_column,
+        aligned_delimiter: false,
+    }
+}
+
+/// `md013_disabled` keeps the limit in `max-width` alone, so no test limit is
+/// silently overridden by an inherited one.
+fn adaptive_rule(max_width: usize, loose_last_column: bool) -> MD060TableFormat {
+    MD060TableFormat::from_config_struct(
+        adaptive_config(max_width, loose_last_column),
+        MD013Config::default(),
+        true,
+    )
+}
+
+fn fix_adaptive(max_width: usize, loose_last_column: bool, content: &str) -> String {
+    let rule = adaptive_rule(max_width, loose_last_column);
+    let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+    rule.fix(&ctx).unwrap()
+}
+
+fn md013_config(line_length: usize) -> MD013Config {
+    MD013Config {
+        line_length: LineLength::from_const(line_length),
+        tables: true,
+        ..Default::default()
+    }
+}
+
+/// Two columns; the last holds "Short" and a 29 column note, so the aligned
+/// table is 40 columns wide with its padding and 36 without.
+const WIDE_LAST_COLUMN: &str = "| Name | Notes |\n|---|---|\n| A | Short |\n| B | A very long note that runs on |";
+
+/// A table that is 15 columns wide aligned and 11 unpadded.
+const SMALL_TABLE: &str = "| Name | Age |\n|---|---|\n| Alice | 30 |";
+
+#[test]
+fn test_md060_aligned_adaptive_is_a_valid_style() {
+    let kebab: MD060Config = toml::from_str("style = \"aligned-adaptive\"").unwrap();
+    assert_eq!(kebab.style, "aligned-adaptive");
+
+    let snake: MD060Config = toml::from_str("style = \"aligned_adaptive\"").unwrap();
+    assert_eq!(
+        snake.style, "aligned-adaptive",
+        "snake_case is normalized like every other style"
+    );
+}
+
+#[test]
+fn test_md060_aligned_adaptive_is_named_in_the_invalid_style_error() {
+    let error = toml::from_str::<MD060Config>("style = \"nonsense\"")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("aligned-adaptive"),
+        "the error should list the new style, got: {error}"
+    );
+}
+
+#[test]
+fn test_md060_aligned_adaptive_stays_padded_while_the_table_fits() {
+    // 15 columns is the padded width, so nothing is given up.
+    assert_eq!(
+        fix_adaptive(15, false, SMALL_TABLE),
+        "| Name  | Age |\n| ----- | --- |\n| Alice | 30  |",
+        "a table inside the limit is written exactly as `aligned` writes it"
+    );
+
+    let aligned = MD060TableFormat::new(true, "aligned".to_string());
+    let ctx = LintContext::new(SMALL_TABLE, MarkdownFlavor::Standard, None);
+    assert_eq!(fix_adaptive(15, false, SMALL_TABLE), aligned.fix(&ctx).unwrap());
+}
+
+#[test]
+fn test_md060_aligned_adaptive_removes_padding_at_the_limit() {
+    // 15 padded does not fit, 11 unpadded does.
+    let fixed = fix_adaptive(11, false, SMALL_TABLE);
+
+    assert_eq!(fixed, "|Name |Age|\n|-----|---|\n|Alice|30 |");
+    let lines: Vec<&str> = fixed.lines().collect();
+    assert_eq!(lines[0].len(), lines[1].len(), "columns stay aligned without padding");
+    assert_eq!(lines[1].len(), lines[2].len(), "columns stay aligned without padding");
+}
+
+#[test]
+fn test_md060_aligned_adaptive_compacts_when_padding_is_not_enough() {
+    // 11 unpadded does not fit either, so alignment is given up.
+    // The fallback uses pad 0, so output is unpadded.
+    assert_eq!(
+        fix_adaptive(10, false, SMALL_TABLE),
+        "|Name|Age|\n|----|---|\n|Alice|30|"
+    );
+}
+
+#[test]
+fn test_md060_aligned_adaptive_reports_nothing_when_padding_alone_brought_it_in_line() {
+    // Before formatting the table is over the limit row by row, so the width
+    // violations are what make `fmt` dispatch in the first place.
+    let rule = adaptive_rule(11, false);
+    let ctx = LintContext::new(SMALL_TABLE, MarkdownFlavor::Standard, None);
+    assert!(
+        !rule.check(&ctx).unwrap().is_empty(),
+        "an unformatted table is always worth reporting"
+    );
+
+    // Once the user applies formatting the padding is gone and every row is
+    // aligned and within the limit: nothing is left to act on.
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_ne!(fixed, SMALL_TABLE, "the table is still rewritten");
+    let ctx = LintContext::new(&fixed, MarkdownFlavor::Standard, None);
+    let warnings = rule.check(&ctx).unwrap();
+    assert!(
+        warnings.is_empty(),
+        "aligned and within the limit in the real current state means nothing to report: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_md060_aligned_adaptive_reports_only_the_compacted_row_when_everything_fits() {
+    let rule = adaptive_rule(10, false);
+    let ctx = LintContext::new(SMALL_TABLE, MarkdownFlavor::Standard, None);
+    assert!(
+        !rule.check(&ctx).unwrap().is_empty(),
+        "an unformatted table is always worth reporting"
+    );
+
+    // The fallback lands every row within the limit — |Name|Age| and
+    // |----|---| sit exactly on the shared geometry, so after formatting only
+    // the body row, which had to be compacted away from that geometry,
+    // keeps warning.
+    let fixed = rule.fix(&ctx).unwrap();
+    let ctx = LintContext::new(&fixed, MarkdownFlavor::Standard, None);
+    let warnings = rule.check(&ctx).unwrap();
+    assert_eq!(warnings.len(), 1, "only the compacted row warns: {warnings:?}");
+    assert_eq!(warnings[0].line, 3, "the Alice row is the compacted one");
+    assert_eq!(
+        warnings[0].message, "Table columns should be aligned",
+        "it fits the limit, so the complaint is the alignment"
+    );
+}
+
+#[test]
+fn test_md060_aligned_adaptive_leaves_a_matching_table_unreported() {
+    let rule = adaptive_rule(80, false);
+    let ctx = LintContext::new(
+        "| Name  | Age |\n| ----- | --- |\n| Alice | 30  |",
+        MarkdownFlavor::Standard,
+        None,
+    );
+
+    assert!(
+        rule.check(&ctx).unwrap().is_empty(),
+        "a table the formatter would not touch must not warn"
+    );
+}
+
+#[test]
+fn test_md060_aligned_adaptive_does_not_narrow_a_table_that_fits() {
+    // `loose-last-column` is a no-op here: the fully aligned table fits, so the
+    // last column keeps its natural width instead of collapsing to the header.
+    let fixed = fix_adaptive(45, true, WIDE_LAST_COLUMN);
+
+    for line in fixed.lines() {
+        assert_eq!(line.len(), 40, "every row is 40 columns wide");
+    }
+    assert!(
+        fixed
+            .lines()
+            .next_back()
+            .unwrap()
+            .ends_with("A very long note that runs on |"),
+        "the last column keeps the 29 columns of its widest cell"
+    );
+
+    let aligned = MD060TableFormat::new(true, "aligned".to_string());
+    let ctx = LintContext::new(WIDE_LAST_COLUMN, MarkdownFlavor::Standard, None);
+    assert_eq!(fixed, aligned.fix(&ctx).unwrap(), "identical to `aligned`");
+}
+
+#[test]
+fn test_md060_aligned_adaptive_maximizes_the_last_column_when_rows_overflow() {
+    // Nothing fits at 40 or 36 columns, so the padding goes first and the last
+    // column then takes the 23 columns the limit leaves over.
+    let fixed = fix_adaptive(30, true, WIDE_LAST_COLUMN);
+
+    let lines: Vec<&str> = fixed.lines().collect();
+    assert_eq!(
+        fixed,
+        "|Name|Notes                  |\n\
+         |----|-----------------------|\n\
+         |A   |Short                  |\n\
+         |B   |A very long note that runs on|",
+        "the header and the short row land exactly on the limit"
+    );
+    for line in &lines[..3] {
+        assert_eq!(line.len(), 30, "rows that can fit do fit");
+    }
+    assert_eq!(lines[3].len(), 36, "a row that cannot fit keeps its own length");
+}
+
+#[test]
+fn test_md060_aligned_adaptive_budgets_the_last_column_unpadded_when_that_fits() {
+    // Padding goes before the last column gives way, so at 13 columns the last
+    // column is budgeted within the already unpadded table.
+    let fixed = fix_adaptive(13, true, WIDE_LAST_COLUMN);
+
+    let lines: Vec<&str> = fixed.lines().collect();
+    assert_eq!(
+        fixed, "|Name|Notes |\n|----|------|\n|A   |Short |\n|B   |A very long note that runs on|",
+        "the padding is gone and the last column is budgeted to 6"
+    );
+    assert_eq!(lines[0].len(), 13, "the header row lands exactly on the limit");
+    assert_eq!(lines[1].len(), 13, "the delimiter row lands exactly on the limit");
+    assert_eq!(lines[3].len(), 36, "the row that cannot fit keeps its own length");
+}
+
+#[test]
+fn test_md060_aligned_adaptive_compacts_only_when_every_row_overflows() {
+    // 10 columns leaves the last column at its three dash floor, and even the
+    // shortest row is 12 wide, so nothing aligned survives.
+    // The fallback uses pad 0.
+    assert_eq!(
+        fix_adaptive(10, true, WIDE_LAST_COLUMN),
+        "|Name|Notes|\n|----|-----|\n|A |Short|\n|B|A very long note that runs on|",
+        "the header and the short row keep their columns at pad 0; the long row overflows"
+    );
+
+    // One column of slack short of that is enough.
+    let fixed = fix_adaptive(12, true, WIDE_LAST_COLUMN);
+    assert_eq!(
+        fixed.lines().next().unwrap().len(),
+        12,
+        "the table stays aligned while its shortest row fits"
+    );
+}
+
+#[test]
+fn test_md060_aligned_adaptive_does_not_budget_the_last_column_without_loose() {
+    // The same table compacts rather than squeezing a column that is not
+    // allowed to give way. The fallback uses pad 0.
+    // At limit=30: header and short row fit at pad 0 (last col=29), long row overflows.
+    assert_eq!(
+        fix_adaptive(30, false, WIDE_LAST_COLUMN),
+        "|Name|Notes                  |\n|----|-----------------------|\n|A   |Short                  |\n|B|A very long note that runs on|"
+    );
+}
+
+#[test]
+fn test_md060_aligned_adaptive_inherits_the_md013_limit() {
+    let config = MD060Config {
+        max_width: LineLength::from_const(0),
+        ..adaptive_config(0, false)
+    };
+    let ctx = LintContext::new(SMALL_TABLE, MarkdownFlavor::Standard, None);
+
+    let rule = MD060TableFormat::from_config_struct(config.clone(), md013_config(11), false);
+    assert_eq!(rule.fix(&ctx).unwrap(), "|Name |Age|\n|-----|---|\n|Alice|30 |");
+
+    let rule = MD060TableFormat::from_config_struct(config, md013_config(10), false);
+    assert_eq!(rule.fix(&ctx).unwrap(), "|Name|Age|\n|----|---|\n|Alice|30|");
+}
+
+#[test]
+fn test_md060_aligned_adaptive_is_unlimited_when_md013_is_disabled() {
+    let rule = adaptive_rule(0, false);
+    let ctx = LintContext::new(SMALL_TABLE, MarkdownFlavor::Standard, None);
+
+    assert_eq!(
+        rule.fix(&ctx).unwrap(),
+        "| Name  | Age |\n| ----- | --- |\n| Alice | 30  |",
+        "no inherited limit means no reason to drop anything"
+    );
+}
+
+#[test]
+fn test_md060_aligned_adaptive_is_idempotent() {
+    for content in [SMALL_TABLE, WIDE_LAST_COLUMN] {
+        for max_width in [4, 10, 11, 12, 15, 16, 30, 36, 40, 80] {
+            for loose_last_column in [false, true] {
+                let rule = adaptive_rule(max_width, loose_last_column);
+
+                let once = rule
+                    .fix(&LintContext::new(content, MarkdownFlavor::Standard, None))
+                    .unwrap();
+                let ctx = LintContext::new(&once, MarkdownFlavor::Standard, None);
+                let twice = rule.fix(&ctx).unwrap();
+
+                assert_eq!(
+                    once, twice,
+                    "max-width {max_width} with loose-last-column {loose_last_column} must be idempotent"
+                );
+
+                // After fixing, check reports exactly the rows that are still
+                // over the limit or compacted away from the header's geometry —
+                // the rows the user could still act on. Everything else, the
+                // padding drop included, stays silent.
+                let fixed_lines: Vec<&str> = once.lines().collect();
+                let cols = fixed_lines[0].split('|').count() - 2;
+                let cells_of = |line: &str, cols: usize| -> Vec<usize> {
+                    line.split('|').skip(1).take(cols).map(|c| c.width()).collect()
+                };
+                let geometry = cells_of(fixed_lines[0], cols);
+                let expected: Vec<usize> = fixed_lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| line.width() > max_width || cells_of(line, cols) != geometry)
+                    .map(|(i, _)| i + 1)
+                    .collect();
+
+                let warnings = rule.check(&ctx).unwrap();
+                let reported: Vec<usize> = warnings.iter().map(|w| w.line).collect();
+                assert_eq!(
+                    reported, expected,
+                    "max-width {max_width} with loose-last-column {loose_last_column} reports exactly the over-wide and compacted rows: {warnings:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_md060_aligned_adaptive_honors_alignment_markers_when_unpadded() {
+    let rule = adaptive_rule(12, false);
+    let ctx = LintContext::new(
+        "| Name | Age |\n|:---|---:|\n| Alice | 30 |",
+        MarkdownFlavor::Standard,
+        None,
+    );
+
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "|Name | Age|\n|:----|---:|\n|Alice|  30|");
+    for line in fixed.lines() {
+        assert_eq!(line.len(), 12, "rows stay aligned without padding");
+    }
+}
+
+#[test]
+fn test_md060_aligned_adaptive_measures_unicode_by_display_width() {
+    // Both columns are four columns wide, so the table is 15 wide padded and 11
+    // unpadded no matter that the cells are two characters each.
+    let table = "| Name | City |\n|---|---|\n| 中文 | 東京 |";
+
+    assert_eq!(
+        fix_adaptive(20, false, table),
+        "| Name | City |\n| ---- | ---- |\n| 中文 | 東京 |",
+        "the padded table fits in 20"
+    );
+    assert_eq!(
+        fix_adaptive(11, false, table),
+        "|Name|City|\n|----|----|\n|中文|東京|",
+        "15 padded does not fit in 11, but 11 unpadded does"
+    );
+
+    for line in fix_adaptive(11, false, table).lines() {
+        assert_eq!(line.width(), 11, "CJK rows stay aligned at their display width");
+    }
+}
+
+#[test]
+fn test_md060_aligned_adaptive_honors_aligned_delimiter_when_it_compacts() {
+    // The fallback fills the delimiter to the header's own column widths, so
+    // `aligned-delimiter` keeps its pipes on the header without re-padding the
+    // dashes: the dropped padding applies to the delimiter row too.
+    let rule = MD060TableFormat::from_config_struct(
+        MD060Config {
+            aligned_delimiter: true,
+            ..adaptive_config(10, false)
+        },
+        MD013Config::default(),
+        true,
+    );
+    let ctx = LintContext::new(SMALL_TABLE, MarkdownFlavor::Standard, None);
+
+    assert_eq!(
+        rule.fix(&ctx).unwrap(),
+        "|Name|Age|\n|----|---|\n|Alice|30|",
+        "the delimiter follows the header's unpadded widths, aligned-delimiter or not"
+    );
+}
+
+#[test]
+fn test_md060_aligned_does_not_drop_padding_where_adaptive_does() {
+    // The new style is opt-in: `aligned` still goes straight to compact where
+    // `aligned-adaptive` would only remove the padding.
+    let ctx = LintContext::new(SMALL_TABLE, MarkdownFlavor::Standard, None);
+
+    let aligned = MD060TableFormat::from_config_struct(
+        MD060Config {
+            style: "aligned".to_string(),
+            max_width: LineLength::from_const(11),
+            ..adaptive_config(11, false)
+        },
+        MD013Config::default(),
+        true,
+    );
+    assert_eq!(
+        aligned.fix(&ctx).unwrap(),
+        "| Name | Age |\n| --- | --- |\n| Alice | 30 |",
+        "`aligned` keeps its single-step auto-compact"
+    );
+    assert_eq!(
+        fix_adaptive(11, false, SMALL_TABLE),
+        "|Name |Age|\n|-----|---|\n|Alice|30 |",
+        "`aligned-adaptive` only gives up the padding"
+    );
+}
+
+/// A table whose rows are all different lengths, so `loose-last-column` has rows
+/// to overflow on. The em dashes and the inline code are part of the widths.
+const OVERFLOWING_ROWS: &str = "\
+| effect             | covered by                                              |
+| ------------------ | ------------------------------------------------------- |
+| width refresh      | `stream_text` (3588) — `set_width` per chunk, both renderers |
+| drop `pending_gap` | `end_response_segment` (3665) — fresh answer renderer per segment |";
+
+#[test]
+fn test_md060_aligned_adaptive_removes_padding_before_budgeting_a_column() {
+    // A table with rows that are over the limit must lose its padding like any
+    // other, and only then have its last column fitted to what is left over.
+    let fixed = fix_adaptive(80, true, OVERFLOWING_ROWS);
+
+    let lines: Vec<&str> = fixed.lines().collect();
+    assert_eq!(
+        lines[0],
+        "|effect            |covered by                                                 |"
+    );
+    assert_eq!(
+        lines[1],
+        "|------------------|-----------------------------------------------------------|"
+    );
+    assert_eq!(lines[0].width(), 80, "the header row lands exactly on the limit");
+    assert_eq!(lines[1].width(), 80, "the delimiter row lands exactly on the limit");
+    assert_eq!(lines[2].width(), 81, "the row one column over keeps its own length");
+    assert_eq!(lines[3].width(), 86, "the longest row keeps its own length");
+
+    for line in &lines[..2] {
+        assert!(
+            !line.starts_with("| "),
+            "the padding is gone rather than squeezed into the column: {line}"
+        );
+    }
+}
+
+#[test]
+fn test_md060_aligned_adaptive_reports_only_the_over_wide_rows() {
+    let rule = adaptive_rule(80, true);
+    let ctx = LintContext::new(OVERFLOWING_ROWS, MarkdownFlavor::Standard, None);
+    assert!(
+        !rule.check(&ctx).unwrap().is_empty(),
+        "an unformatted table is always worth reporting"
+    );
+
+    // Once formatted the table is aligned and within the limit except for the
+    // two rows whose content is longer than 80 columns: only those report.
+    let fixed = rule.fix(&ctx).unwrap();
+    let ctx = LintContext::new(&fixed, MarkdownFlavor::Standard, None);
+    let warnings = rule.check(&ctx).unwrap();
+    assert_eq!(warnings.len(), 2, "only the two rows past the limit: {warnings:?}");
+
+    assert_eq!(warnings[0].line, 3);
+    assert_eq!(
+        warnings[0].message,
+        "Table too wide for aligned formatting (81 chars > max-width: 80), padding removed"
+    );
+    assert_eq!(warnings[1].line, 4);
+    assert_eq!(
+        warnings[1].message,
+        "Table too wide for aligned formatting (86 chars > max-width: 80), padding removed"
+    );
+}
+
+/// A mis-aligned table that is 85 columns wide padded and 79 unpadded, so at a
+/// limit of 80 it only fits once its padding is gone.
+const VOCABULARY_TABLE: &str = "|vocabulary                                     |owned by   |produced by|\n|----------------------------------|-----------|-----------|\n|`Element` (chrome rows)                        |`draw.rs`  |`ui/`      |\n|`Boundary { kind: ContentDisplayKind, closes }`|`draw.rs`  |`content/` |\n|`BarText` (was `StatusText`)  |`ui/bar.rs`|`agent/status.rs`|";
+
+#[test]
+fn test_md060_aligned_adaptive_removes_the_padding_of_a_table_that_only_fits_unpadded() {
+    let fixed = fix_adaptive(80, false, VOCABULARY_TABLE);
+    let lines: Vec<&str> = fixed.lines().collect();
+
+    // 85 columns with the padding, 79 without, so the padding is what has to go.
+    for line in &lines {
+        assert_eq!(line.width(), 79, "the whole table fits within the limit: {line:?}");
+    }
+
+    assert_eq!(
+        lines[1],
+        format!("|{}|{}|{}|", "-".repeat(47), "-".repeat(11), "-".repeat(17)),
+        "the delimiter fills the columns it has to"
+    );
+
+    for line in &lines {
+        assert!(
+            !line.contains("| "),
+            "no cell carries padding around its content: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn test_md060_aligned_adaptive_reports_nothing_when_padding_alone_fits_the_table() {
+    // Before formatting the table is 85 columns wide with its padding and
+    // ragged besides, so the width violations are what make `fmt` dispatch.
+    let rule = adaptive_rule(80, false);
+    let ctx = LintContext::new(VOCABULARY_TABLE, MarkdownFlavor::Standard, None);
+    assert!(
+        !rule.check(&ctx).unwrap().is_empty(),
+        "an unformatted table is always worth reporting"
+    );
+
+    // Once the padding is gone every row sits on the shared geometry within
+    // the limit: nothing is left to act on.
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_ne!(fixed, VOCABULARY_TABLE, "the table is still rewritten");
+    let ctx = LintContext::new(&fixed, MarkdownFlavor::Standard, None);
+    let warnings = rule.check(&ctx).unwrap();
+    assert!(
+        warnings.is_empty(),
+        "aligned and within the limit in the real current state means nothing to report: {warnings:?}"
+    );
+}
+
+/// A table whose long cell makes no layout fit: 94 columns with padding, 90
+/// without, and the description column alone is 78 wide.
+const OVERSIZED_TABLE: &str = "| Option | Description | Status |\n| --- | --- | --- |\n| a | does the thing quickly | ok |\n| b | does the thing slowly but carefully | fine |\n| c | an extremely long description that goes on and on | nope |";
+
+#[test]
+fn test_md060_aligned_adaptive_scales_the_columns_to_keep_the_header_within_the_limit() {
+    // The target widths keep the columns' natural widths from the left and
+    // give way only to the right, so the header and the delimiter row land
+    // exactly on the limit and the rows that fit keep the same columns.
+    let fixed = fix_adaptive(60, false, OVERSIZED_TABLE);
+    let lines: Vec<&str> = fixed.lines().collect();
+
+    for line in &lines[..4] {
+        assert_eq!(
+            line.width(),
+            60,
+            "the header and the rows that fit land on the limit: {line:?}"
+        );
+    }
+    assert_eq!(
+        lines[0].split('|').skip(1).map(|c| c.width()).collect::<Vec<_>>(),
+        lines[1].split('|').skip(1).map(|c| c.width()).collect::<Vec<_>>(),
+        "the delimiter row is written to the widths the header settled on"
+    );
+    for line in &lines[..4] {
+        assert_eq!(
+            line.split('|').skip(1).map(|c| c.width()).collect::<Vec<_>>(),
+            lines[0].split('|').skip(1).map(|c| c.width()).collect::<Vec<_>>(),
+            "the columns line up across every row that fits"
+        );
+    }
+}
+
+#[test]
+fn test_md060_aligned_adaptive_keeps_the_leftmost_column_at_its_natural_width() {
+    // The first column's natural width is 8 ("99999999"). It must survive the
+    // fallback untouched: only the column further right gives way to the limit,
+    // and a row compacted by the fallback narrows its own cells without the
+    // column itself shifting for the rows around it.
+    let input =
+        "|numbers|long text|\n|---|---|\n|1|not that long|\n|6664|row getting compacted|\n|99999999|left column width|";
+    let fixed = fix_adaptive(29, false, input);
+
+    assert_eq!(
+        fixed,
+        "|numbers |long text         |\n\
+         |--------|------------------|\n\
+         |1       |not that long     |\n\
+         |6664 |row getting compacted|\n\
+         |99999999|left column width |",
+        "the left column keeps its natural width; only the right column shrinks, \
+         and only the over-long row is compacted — starting from the right"
+    );
+
+    let lines: Vec<&str> = fixed.lines().collect();
+    for i in [0, 1, 2, 4] {
+        let first_cell = lines[i].split('|').nth(1).unwrap();
+        assert_eq!(
+            first_cell.width(),
+            8,
+            "row {} keeps the left column's width: {lines:?}",
+            i + 1
+        );
+    }
+    assert_eq!(lines[0].width(), 29, "the header fills the limit");
+}
+
+#[test]
+fn test_md060_aligned_adaptive_pushes_a_slightly_over_row_left_and_gives_up_on_a_long_one() {
+    let fixed = fix_adaptive(40, false, OVERSIZED_TABLE);
+    let lines: Vec<&str> = fixed.lines().collect();
+
+    assert_eq!(lines[0].width(), 40, "the header fits after the columns were scaled");
+    assert_eq!(lines[2].width(), 40, "the short row fits as it stands");
+
+    // The row that is 10 over gives up the padding of its rightmost cells, which
+    // is all of it here (pad 0), and keeps the alignment of its first column
+    // for as long as there is width to give.
+    assert!(
+        lines[3].starts_with("|b"),
+        "the left column stays aligned: {:?}",
+        lines[3]
+    );
+    assert!(
+        lines[3].width() > 40,
+        "a row whose content alone is too wide cannot be made to fit"
+    );
+
+    // The row whose own cell is far too wide has no padding to give at all, so it
+    // comes out looking compact (and, at pad 0, unpadded).
+    assert!(
+        lines[4].starts_with("|c|"),
+        "the hopeless row is pushed all the way left: {:?}",
+        lines[4]
+    );
+    assert!(lines[4].contains("|an extremely long description that goes on and on|nope|"));
+}
+
+#[test]
+fn test_md060_aligned_adaptive_keeps_the_header_when_it_cannot_fit() {
+    // No layout can fit 15 columns, so the header keeps the widths its own
+    // values need and the rows below it follow.
+    let fixed = fix_adaptive(15, false, OVERSIZED_TABLE);
+    let lines: Vec<&str> = fixed.lines().collect();
+
+    assert_eq!(
+        lines[0], "|Option|Description|Status|",
+        "the header is not squeezed below its own values"
+    );
+    assert_eq!(
+        lines[1], "|------|-----------|------|",
+        "the delimiter row follows the header"
+    );
+    for line in &lines[..2] {
+        assert!(line.width() > 15, "what the header holds is wider than the limit");
+    }
+}
+
+#[test]
+fn test_md060_aligned_adaptive_reports_the_rows_it_could_not_fit() {
+    // The same table written with padding, so the rows that run past the limit
+    // are rows the fix actually rewrites. Before formatting the whole table is
+    // past the limit and ragged, so every row reports something.
+    let padded = OVERSIZED_TABLE
+        .replace("| a |", "| a      |")
+        .replace("| b |", "| b      |")
+        .replace("| c |", "| c      |");
+    let rule = adaptive_rule(40, false);
+    let ctx = LintContext::new(&padded, MarkdownFlavor::Standard, None);
+    assert!(
+        !rule.check(&ctx).unwrap().is_empty(),
+        "an unformatted table is always worth reporting"
+    );
+
+    // After formatting, the header and the rows that fit are the geometry,
+    // not a problem; only the rows no width could hold keep warning.
+    let fixed = rule.fix(&ctx).unwrap();
+    let ctx = LintContext::new(&fixed, MarkdownFlavor::Standard, None);
+    let warnings = rule.check(&ctx).unwrap();
+    assert_eq!(
+        warnings.len(),
+        2,
+        "the header and the rows that fit are the geometry, not a problem: {warnings:?}"
+    );
+    for warning in &warnings {
+        assert!(
+            warning.message.starts_with("Table too wide for aligned formatting ("),
+            "only a row past the limit may say so: {}",
+            warning.message
+        );
+    }
 }
