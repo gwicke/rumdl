@@ -8,6 +8,7 @@ use unicode_width::UnicodeWidthStr;
 mod md060_config;
 use crate::md013_line_length::MD013Config;
 pub use md060_config::ColumnAlign;
+pub use md060_config::ConvertWideToList;
 pub use md060_config::MD060Config;
 
 /// Identifies the type of row in a table for formatting purposes.
@@ -45,6 +46,11 @@ enum Degradation {
 struct TableFormatResult {
     lines: Vec<String>,
     degradation: Degradation,
+    /// Set when `convert-wide-to-list` fires: the table block, fully prefixed,
+    /// rewritten as a nested list. Its line count differs from the table's, so
+    /// `check` builds the fix from this and `fix` splices it in place of the
+    /// whole block instead of zipping lines 1:1.
+    replacement: Option<Vec<String>>,
 }
 
 /// Spaces on each side of a cell's content in the aligned styles.
@@ -320,6 +326,7 @@ impl MD060TableFormat {
                 column_align_body: None,
                 loose_last_column: false,
                 aligned_delimiter: false,
+                convert_wide_to_list: ConvertWideToList::Disabled,
             },
             md013_config: MD013Config::default(),
             md013_disabled: false,
@@ -728,8 +735,12 @@ impl MD060TableFormat {
             .zip(&content_widths)
             .map(|(&width, &content)| width.max(content))
             .collect();
-        let mut excess =
-            MD060TableFormat::pipes_and_padding(row_widths.len(), pad_width) + row_widths.iter().sum::<usize>() - limit;
+        // A row narrower than the limit has nothing to give up; saturating
+        // keeps the give-up loop below from underflowing on rows that already
+        // fit (a ragged row with fewer cells than the table has columns).
+        let mut excess = (MD060TableFormat::pipes_and_padding(row_widths.len(), pad_width)
+            + row_widths.iter().sum::<usize>())
+        .saturating_sub(limit);
 
         for i in (0..row_widths.len()).rev() {
             if excess == 0 {
@@ -742,6 +753,36 @@ impl MD060TableFormat {
         }
 
         row_widths
+    }
+
+    /// Render the table's content rows as the nested list that
+    /// `convert-wide-to-list` writes: the first column labels a top-level item
+    /// (`- **Heading**: value`), every later column a sibling at the first
+    /// indentation level. The header row becomes the labels, the delimiter row
+    /// is dropped, and cells render as written so links, code spans, and
+    /// escapes survive the conversion untouched.
+    fn convert_table_to_list(
+        header_cells: &[String],
+        content_rows: &[&str],
+        flavor: crate::config::MarkdownFlavor,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        for row in content_rows {
+            let cells = Self::parse_table_row_with_flavor(row, flavor);
+            for (i, cell) in cells.iter().enumerate() {
+                let indent = if i == 0 { "" } else { "  " };
+                let label = header_cells.get(i).map_or("", |h| h.trim());
+                let value = cell.trim();
+                let line = if label.is_empty() {
+                    format!("{indent}- {value}")
+                } else {
+                    format!("{indent}- **{label}**: {value}")
+                };
+                // An empty value leaves the `: ` dangling; drop it.
+                lines.push(line.trim_end().to_string());
+            }
+        }
+        lines
     }
 
     fn format_table_compact(cells: &[String]) -> String {
@@ -1064,6 +1105,9 @@ impl MD060TableFormat {
     ) -> TableFormatResult {
         let mut result = Vec::new();
         let mut degradation = Degradation::None;
+        // Set when `convert-wide-to-list` fires: the content rows rendered as
+        // the nested list (unprefixed), later prefixed like `result`.
+        let mut converted: Option<Vec<String>> = None;
 
         let table_lines: Vec<&str> = std::iter::once(lines[table_block.header_line])
             .chain(std::iter::once(lines[table_block.delimiter_line]))
@@ -1074,6 +1118,7 @@ impl MD060TableFormat {
             return TableFormatResult {
                 lines: table_lines.iter().map(std::string::ToString::to_string).collect(),
                 degradation: Degradation::None,
+                replacement: None,
             };
         }
 
@@ -1129,6 +1174,7 @@ impl MD060TableFormat {
                     return TableFormatResult {
                         lines: table_lines.iter().map(std::string::ToString::to_string).collect(),
                         degradation: Degradation::None,
+                        replacement: None,
                     };
                 }
 
@@ -1232,6 +1278,7 @@ impl MD060TableFormat {
                         return TableFormatResult {
                             lines: table_lines.iter().map(std::string::ToString::to_string).collect(),
                             degradation: Degradation::None,
+                            replacement: None,
                         };
                     }
 
@@ -1276,6 +1323,66 @@ impl MD060TableFormat {
                                 .unwrap_or_else(|| layout.floors.clone());
                             let column_widths =
                                 Self::fitted_row_widths(&header_cells, &column_widths, ADAPTIVE_PAD_WIDTH, limit);
+
+                            // `convert-wide-to-list = "auto"`: once a majority
+                            // of content rows cannot be laid out aligned within
+                            // `max-width`, the table is rendered as a nested
+                            // list instead of a best-effort ragged table.
+                            // Header and delimiter are excluded from the
+                            // trigger: the delimiter follows the header by
+                            // construction, and the header is what defines the
+                            // geometry.
+                            if self.config.convert_wide_to_list == ConvertWideToList::Auto && stripped_lines.len() > 2 {
+                                let content_rows = &stripped_lines[2..];
+                                let hopeless = content_rows
+                                    .iter()
+                                    .filter(|line| {
+                                        let cells = Self::parse_table_row_with_flavor(line, flavor);
+                                        // A row without cells (a pipe-less line
+                                        // the detector swept up) has nothing to
+                                        // render as items — and nothing the table
+                                        // formatter keeps either — so it counts
+                                        // as alignable rather than towards the
+                                        // majority.
+                                        if cells.is_empty() {
+                                            return false;
+                                        }
+                                        // The row is over the limit where the
+                                        // table wants to put it, or it cannot sit
+                                        // on the geometry at all: a cell wider
+                                        // than its column, or fewer cells than
+                                        // the table has columns (right-to-left
+                                        // compaction below is what moves such
+                                        // rows off the geometry).
+                                        let content_widths: Vec<usize> = cells
+                                            .iter()
+                                            .map(|cell| Self::calculate_cell_display_width(cell))
+                                            .collect();
+                                        let start: Vec<usize> = column_widths
+                                            .iter()
+                                            .zip(&content_widths)
+                                            .map(|(&width, &content)| width.max(content))
+                                            .collect();
+                                        let over_at_geometry =
+                                            (Self::pipes_and_padding(start.len(), ADAPTIVE_PAD_WIDTH)
+                                                + start.iter().sum::<usize>())
+                                                > limit;
+                                        over_at_geometry
+                                            || Self::fitted_row_widths(
+                                                &cells,
+                                                &column_widths,
+                                                ADAPTIVE_PAD_WIDTH,
+                                                limit,
+                                            ) != column_widths
+                                    })
+                                    .count();
+                                if hopeless * 2 > content_rows.len() {
+                                    let list = Self::convert_table_to_list(&header_cells, content_rows, flavor);
+                                    if !list.is_empty() {
+                                        converted = Some(list);
+                                    }
+                                }
+                            }
 
                             for (row_idx, line) in stripped_lines.iter().enumerate() {
                                 let cells = Self::parse_table_row_with_flavor(line, flavor);
@@ -1355,6 +1462,7 @@ impl MD060TableFormat {
                             return TableFormatResult {
                                 lines: table_lines.iter().map(std::string::ToString::to_string).collect(),
                                 degradation: Degradation::None,
+                                replacement: None,
                             };
                         }
 
@@ -1391,34 +1499,64 @@ impl MD060TableFormat {
                 return TableFormatResult {
                     lines: table_lines.iter().map(std::string::ToString::to_string).collect(),
                     degradation: Degradation::None,
+                    replacement: None,
                 };
             }
         }
 
-        // Re-add blockquote prefix and list prefix to all formatted lines
+        // Re-add blockquote prefix and list prefix to all formatted lines.
+        let prefix_line = |i: usize, line: String| -> String {
+            if let Some(mdg_indent) = &mdg_indent {
+                format!("{blockquote_prefix}{mdg_indent}{line}")
+            } else if list_context.is_some() {
+                if i == 0 {
+                    // Header line: add list prefix
+                    format!("{blockquote_prefix}{list_prefix}{line}")
+                } else {
+                    // Continuation lines: add indentation
+                    format!("{blockquote_prefix}{continuation_indent}{line}")
+                }
+            } else {
+                format!("{blockquote_prefix}{line}")
+            }
+        };
+
+        // The converted list prefixes differently from a rewritten table: its
+        // own first line already starts with a bullet, so re-adding a bullet
+        // marker would nest a marker in a marker (`- - x`), which MD069 reads
+        // as a duplicate and collapses — losing the row structure on the way.
+        // The marker line is instead reused for the first row's item, keeping
+        // only the indentation it sat at. An ordered marker has to wrap the
+        // block (`1. - x`): consuming it would swap the list from ordered to
+        // bullets.
+        let prefix_replacement = |i: usize, line: String| -> String {
+            if let Some(mdg_indent) = &mdg_indent {
+                format!("{blockquote_prefix}{mdg_indent}{line}")
+            } else if list_prefix.trim_start().starts_with(['-', '*', '+']) {
+                let indent: String = list_prefix.chars().take_while(|c| c.is_whitespace()).collect();
+                format!("{blockquote_prefix}{indent}{line}")
+            } else {
+                prefix_line(i, line)
+            }
+        };
+
         let prefixed_result: Vec<String> = result
             .into_iter()
             .enumerate()
-            .map(|(i, line)| {
-                if let Some(mdg_indent) = &mdg_indent {
-                    format!("{blockquote_prefix}{mdg_indent}{line}")
-                } else if list_context.is_some() {
-                    if i == 0 {
-                        // Header line: add list prefix
-                        format!("{blockquote_prefix}{list_prefix}{line}")
-                    } else {
-                        // Continuation lines: add indentation
-                        format!("{blockquote_prefix}{continuation_indent}{line}")
-                    }
-                } else {
-                    format!("{blockquote_prefix}{line}")
-                }
-            })
+            .map(|(i, line)| prefix_line(i, line))
             .collect();
+        let replacement = converted.map(|lines| {
+            lines
+                .into_iter()
+                .enumerate()
+                .map(|(i, line)| prefix_replacement(i, line))
+                .collect()
+        });
 
         TableFormatResult {
             lines: prefixed_result,
             degradation,
+            replacement,
         }
     }
 }
@@ -1459,23 +1597,80 @@ impl Rule for MD060TableFormat {
             let table_start_line = table_block.start_line + 1; // Convert to 1-indexed
             let table_end_line = table_block.end_line + 1; // Convert to 1-indexed
 
-            // Build the complete fixed table content
-            let mut fixed_table_lines: Vec<String> = Vec::with_capacity(table_line_indices.len());
-            for (i, &line_idx) in table_line_indices.iter().enumerate() {
-                let fixed_line = &format_result.lines[i];
-                // Add newline for all lines except the last if the original didn't have one
-                if line_idx < lines.len() - 1 {
-                    fixed_table_lines.push(format!("{fixed_line}\n"));
-                } else {
-                    fixed_table_lines.push(fixed_line.clone());
+            // Build the complete fixed table content. A conversion replaces the
+            // block with a different number of lines, so its text comes from the
+            // replacement; the newline rule mirrors the per-line loop: every
+            // line is terminated, except the block's last when that line is
+            // also the document's last (the byte range ends at EOF there).
+            let table_replacement = match &format_result.replacement {
+                Some(replacement) => {
+                    let mut text = String::new();
+                    for (j, line) in replacement.iter().enumerate() {
+                        text.push_str(line);
+                        let is_last = j + 1 == replacement.len();
+                        if !(is_last && table_block.end_line + 1 == lines.len()) {
+                            text.push('\n');
+                        }
+                    }
+                    text
                 }
-            }
-            let table_replacement = fixed_table_lines.concat();
+                None => {
+                    let mut fixed_table_lines: Vec<String> = Vec::with_capacity(table_line_indices.len());
+                    for (i, &line_idx) in table_line_indices.iter().enumerate() {
+                        let fixed_line = &format_result.lines[i];
+                        // Add newline for all lines except the last if the original didn't have one
+                        if line_idx < lines.len() - 1 {
+                            fixed_table_lines.push(format!("{fixed_line}\n"));
+                        } else {
+                            fixed_table_lines.push(fixed_line.clone());
+                        }
+                    }
+                    fixed_table_lines.concat()
+                }
+            };
             let table_range = ctx.line_span_byte_range(table_start_line, table_end_line);
 
             let max_width = self.effective_max_width();
 
             if self.config.style == "aligned-adaptive" {
+                if format_result.replacement.is_some() {
+                    // The block becomes a list, so every warning on it carries
+                    // the conversion as its fix. Content rows always report —
+                    // the fix rewrites each of them — and a header or delimiter
+                    // line reports only when it breaks `max-width` itself,
+                    // which is a fact about the file as it stands.
+                    let fix = Some(crate::rule::Fix::new(table_range.clone(), table_replacement.clone()));
+                    for (i, &line_idx) in table_line_indices.iter().enumerate() {
+                        let original = lines[line_idx];
+                        let line_width = UnicodeWidthStr::width(original);
+                        let over = line_width > max_width;
+                        if i < 2 && !over {
+                            continue;
+                        }
+
+                        let (start_line, start_col, end_line, end_col) = calculate_line_range(line_idx + 1, original);
+                        let message = if over {
+                            format!(
+                                "Table too wide for aligned formatting ({line_width} chars > max-width: {max_width}), convert to a list"
+                            )
+                        } else {
+                            format!("Table columns cannot be aligned within max-width ({max_width}), convert to a list")
+                        };
+
+                        warnings.push(LintWarning {
+                            rule_name: Some(self.name().to_string()),
+                            severity: Severity::Warning,
+                            message,
+                            line: start_line,
+                            column: start_col,
+                            end_line,
+                            end_column: end_col,
+                            fix: fix.clone(),
+                        });
+                    }
+                    continue;
+                }
+
                 // For `aligned-adaptive`, warnings are per-row facts about the
                 // file as it stands right now:
                 //
@@ -1597,7 +1792,11 @@ impl Rule for MD060TableFormat {
             return Ok(content.to_string());
         }
 
-        let mut result_lines: Vec<String> = lines.iter().map(|&s| s.to_string()).collect();
+        // Walk the document in order, writing either the original lines or
+        // each table's rewrite. A conversion changes the block's line count,
+        // so tables cannot be patched in place by absolute index.
+        let mut result_lines: Vec<String> = Vec::with_capacity(lines.len());
+        let mut cursor = 0usize;
 
         for table_block in table_blocks {
             let format_result = self.fix_table_block(lines, table_block, ctx.flavor);
@@ -1613,13 +1812,31 @@ impl Rule for MD060TableFormat {
                 .iter()
                 .any(|&line_idx| ctx.inline_config().is_rule_disabled(self.name(), line_idx + 1));
 
+            // Non-table lines up to the block, unchanged.
+            for &line in &lines[cursor..table_block.start_line] {
+                result_lines.push(line.to_string());
+            }
+            cursor = table_block.end_line + 1;
+
             if any_disabled {
+                for &line in &lines[table_block.start_line..cursor] {
+                    result_lines.push(line.to_string());
+                }
                 continue;
             }
 
-            for (i, &line_idx) in table_line_indices.iter().enumerate() {
-                result_lines[line_idx].clone_from(&format_result.lines[i]);
+            match format_result.replacement {
+                Some(ref replacement) => {
+                    result_lines.extend(replacement.iter().cloned());
+                }
+                None => {
+                    result_lines.extend(format_result.lines.iter().cloned());
+                }
             }
+        }
+
+        for &line in &lines[cursor..] {
+            result_lines.push(line.to_string());
         }
 
         let mut fixed = result_lines.join("\n");
@@ -1845,6 +2062,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, md013_with_line_length(80), false);
 
@@ -1996,6 +2214,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, md013_with_line_length(80), false);
 
@@ -2030,6 +2249,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, md013_with_line_length(80), false); // MD013 setting doesn't matter
 
@@ -2065,6 +2285,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, md013_with_line_length(80), false);
 
@@ -2095,6 +2316,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, md013_with_line_length(30), false);
 
@@ -2122,6 +2344,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule_tight = MD060TableFormat::from_config_struct(config_tight, md013_with_line_length(80), false);
 
@@ -2143,6 +2366,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, md013_with_line_length(80), false);
 
@@ -2171,6 +2395,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
 
         // Test with different MD013 line_length values
@@ -2207,6 +2432,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, md013_with_line_length(80), false);
 
@@ -2231,6 +2457,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule_under = MD060TableFormat::from_config_struct(config_under, md013_with_line_length(80), false);
 
@@ -2253,6 +2480,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, md013_with_line_length(80), false);
 
@@ -2327,6 +2555,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, md013_with_line_length(80), false);
 
@@ -2359,6 +2588,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let md013_config = MD013Config::default();
         let rule = MD060TableFormat::from_config_struct(config, md013_config, true /* disabled */);
@@ -2390,6 +2620,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let md013_config = MD013Config {
             tables: false, // User doesn't care about table line length
@@ -2424,6 +2655,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let md013_config = MD013Config {
             tables: true,
@@ -2458,6 +2690,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let md013_config = MD013Config {
             tables: false,                          // This would make it unlimited...
@@ -2490,6 +2723,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let md013_config = MD013Config {
             tables: true,
@@ -2525,6 +2759,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -2563,6 +2798,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -2590,6 +2826,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -2617,6 +2854,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -2681,6 +2919,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -2713,6 +2952,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -2743,6 +2983,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -2772,6 +3013,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -2807,6 +3049,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -2838,6 +3081,7 @@ mod tests {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -2920,6 +3164,7 @@ style = "aligned"
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -2955,6 +3200,7 @@ style = "aligned"
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -2981,6 +3227,7 @@ style = "aligned"
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -3008,6 +3255,7 @@ style = "aligned"
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -3035,6 +3283,7 @@ style = "aligned"
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 
@@ -3064,6 +3313,7 @@ style = "aligned"
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::Disabled,
         };
         let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), false);
 

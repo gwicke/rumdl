@@ -1,7 +1,8 @@
-use rumdl_lib::config::MarkdownFlavor;
+use rumdl_lib::config::{Config, MarkdownFlavor, RuleConfig};
+use rumdl_lib::fix_coordinator::FixCoordinator;
 use rumdl_lib::lint_context::LintContext;
 use rumdl_lib::rule::Rule;
-use rumdl_lib::rules::{ColumnAlign, MD013Config, MD060Config, MD060TableFormat};
+use rumdl_lib::rules::{ColumnAlign, ConvertWideToList, MD013Config, MD013LineLength, MD060Config, MD060TableFormat};
 use rumdl_lib::types::LineLength;
 use unicode_width::UnicodeWidthStr;
 
@@ -1893,6 +1894,7 @@ fn test_md060_loose_last_column_basic() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -1962,6 +1964,7 @@ fn test_md060_loose_last_column_header_delimiter_still_aligned() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -1991,6 +1994,7 @@ fn test_md060_loose_last_column_multiple_columns() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2026,6 +2030,7 @@ fn test_md060_loose_last_column_single_column_table() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2060,6 +2065,7 @@ fn test_md060_column_align_header_basic() {
         column_align_body: None,
         loose_last_column: false,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2102,6 +2108,7 @@ fn test_md060_column_align_body_basic() {
         column_align_body: Some(ColumnAlign::Right), // Body is right-aligned
         loose_last_column: false,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2143,6 +2150,7 @@ fn test_md060_column_align_header_and_body_different() {
         column_align_body: Some(ColumnAlign::Left),     // Body left-aligned
         loose_last_column: false,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2174,6 +2182,7 @@ fn test_md060_column_align_header_only_set() {
         column_align_body: None,                      // Body uses column_align (Right)
         loose_last_column: false,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2201,6 +2210,7 @@ fn test_md060_column_align_body_only_set() {
         column_align_body: Some(ColumnAlign::Center), // Body centered
         loose_last_column: false,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2227,6 +2237,7 @@ fn test_md060_column_align_auto_with_header_body_override() {
         column_align_body: None,                        // Body uses Auto (delimiter markers)
         loose_last_column: false,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2268,6 +2279,7 @@ fn test_md060_column_align_all_combinations() {
                 column_align_body: body_align,
                 loose_last_column: false,
                 aligned_delimiter: false,
+                convert_wide_to_list: ConvertWideToList::Disabled,
             };
             let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2300,6 +2312,7 @@ fn test_md060_loose_last_column_with_header_body_alignment() {
         column_align_body: Some(ColumnAlign::Left),
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2329,6 +2342,7 @@ fn test_md060_features_idempotency() {
         column_align_body: Some(ColumnAlign::Left),
         loose_last_column: false, // Keep strict for idempotency test
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config.clone(), default_md013_config(), false);
 
@@ -2360,6 +2374,7 @@ fn test_md060_loose_last_column_exact_output() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2392,6 +2407,7 @@ fn test_md060_loose_last_column_empty_cell() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2428,6 +2444,7 @@ fn test_md060_loose_last_column_preserves_alignment_markers() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2456,6 +2473,7 @@ fn test_md060_column_align_header_center_exact() {
         column_align_body: None, // Uses column_align (Left)
         loose_last_column: false,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2506,6 +2524,7 @@ fn test_md060_column_align_body_right_exact() {
         column_align_body: Some(ColumnAlign::Right),
         loose_last_column: false,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2550,6 +2569,7 @@ fn test_md060_delimiter_unaffected_by_column_align() {
         column_align_body: Some(ColumnAlign::Left),
         loose_last_column: false,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -2587,6 +2607,7 @@ fn test_md060_loose_last_column_with_cjk() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -3041,6 +3062,7 @@ fn test_md060_loose_last_column_header_caps_width() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -3079,6 +3101,7 @@ fn test_md060_loose_last_column_body_shorter_than_header() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -3110,6 +3133,7 @@ fn test_md060_loose_last_column_three_columns_exact_output() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -3140,6 +3164,7 @@ fn test_md060_loose_last_column_idempotent() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -3168,6 +3193,7 @@ fn test_md060_loose_last_column_single_column_follow_header() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -3193,6 +3219,7 @@ fn test_md060_loose_last_column_with_alignment_markers_follow() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -3225,6 +3252,7 @@ fn test_md060_loose_last_column_cjk_follow_header() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -3250,6 +3278,7 @@ fn test_md060_loose_last_column_aligned_no_space_style() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -3281,6 +3310,7 @@ fn test_md060_loose_last_column_all_body_shorter_than_header() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let config_strict = MD060Config {
         enabled: true,
@@ -3291,6 +3321,7 @@ fn test_md060_loose_last_column_all_body_shorter_than_header() {
         column_align_body: None,
         loose_last_column: false,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
 
     let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
@@ -3319,6 +3350,7 @@ fn test_md060_loose_last_column_header_only_table() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -3346,6 +3378,7 @@ fn test_md060_loose_last_column_empty_header_last_col() {
         column_align_body: None,
         loose_last_column: true,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     };
     let rule = MD060TableFormat::from_config_struct(config, default_md013_config(), false);
 
@@ -3377,6 +3410,7 @@ fn md060_config_with_aligned_delimiter(style: &str, aligned_delimiter: bool) -> 
         column_align_body: None,
         loose_last_column: false,
         aligned_delimiter,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     }
 }
 
@@ -3533,6 +3567,7 @@ fn md060_aligned_config_with_max_width(aligned_delimiter: bool, max_width: usize
         column_align_body: None,
         loose_last_column: false,
         aligned_delimiter,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     }
 }
 
@@ -3705,6 +3740,7 @@ fn adaptive_config(max_width: usize, loose_last_column: bool) -> MD060Config {
         column_align_body: None,
         loose_last_column,
         aligned_delimiter: false,
+        convert_wide_to_list: ConvertWideToList::Disabled,
     }
 }
 
@@ -4069,6 +4105,7 @@ fn test_md060_aligned_adaptive_honors_aligned_delimiter_when_it_compacts() {
     let rule = MD060TableFormat::from_config_struct(
         MD060Config {
             aligned_delimiter: true,
+            convert_wide_to_list: ConvertWideToList::Disabled,
             ..adaptive_config(10, false)
         },
         MD013Config::default(),
@@ -4376,4 +4413,352 @@ fn test_md060_aligned_adaptive_reports_the_rows_it_could_not_fit() {
             warning.message
         );
     }
+}
+
+// ── convert-wide-to-list ────────────────────────────────────────────────
+
+/// Every content row is forced off the shared geometry once the pad-0 layout
+/// (21 wide) exceeds 20, which is what hands this table to the list renderer.
+const CONVERTIBLE_TABLE: &str = "\
+| Heading 1  | Heading 2 |
+| ---------- | --------- |
+| R1 val 1   | R1 val 2  |
+| R2 val 2   | R2 val 2  |";
+
+const CONVERTIBLE_EXPECTED: &str = "- **Heading 1**: R1 val 1\n  - **Heading 2**: R1 val 2\n\
+                                    - **Heading 1**: R2 val 2\n  - **Heading 2**: R2 val 2";
+
+fn converting_config(max_width: usize) -> MD060Config {
+    MD060Config {
+        convert_wide_to_list: ConvertWideToList::Auto,
+        ..adaptive_config(max_width, false)
+    }
+}
+
+fn converting_rule(max_width: usize) -> MD060TableFormat {
+    MD060TableFormat::from_config_struct(converting_config(max_width), MD013Config::default(), true)
+}
+
+fn fix_converting(max_width: usize, content: &str) -> String {
+    let rule = converting_rule(max_width);
+    let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+    rule.fix(&ctx).unwrap()
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_rewrites_hopeless_table() {
+    // Both content rows are forced off the shared geometry — a majority of
+    // any size — so the table goes to the list renderer.
+    let fixed = fix_converting(20, CONVERTIBLE_TABLE);
+    assert_eq!(fixed, CONVERTIBLE_EXPECTED);
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_disabled_by_default() {
+    // Without the option the adaptive style keeps compacting row by row,
+    // however ragged the result — the option is what changes the output kind.
+    let rule = adaptive_rule(20, false);
+    let ctx = LintContext::new(CONVERTIBLE_TABLE, MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(
+        fixed,
+        "|Heading 1|Heading 2|\n|---------|---------|\n|R1 val 1 |R1 val 2|\n|R2 val 2 |R2 val 2|"
+    );
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_leaves_table_with_a_row_that_fits() {
+    // The header fixes a geometry that fills the limit exactly, the wide row
+    // is compacted off it, but the short row sits on it — one aligned row of
+    // two leaves the hopeless row in the minority, so the table stays.
+    let content = "| H1 | H2 |\n| --- | --- |\n| fitting row here | y |\n| tiny | y |";
+    let fixed = fix_converting(20, content);
+    assert_eq!(
+        fixed,
+        "|H1            |H2 |\n|--------------|---|\n|fitting row here|y|\n|tiny          |y  |"
+    );
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_fires_on_a_majority_of_rows() {
+    // Only the short row sits on the geometry; the two wide rows are the
+    // majority, and a majority hands the whole table to the list renderer —
+    // the aligned row goes with it.
+    let content = "| H1 | H2 |\n| --- | --- |\n| fitting row here | y |\n| tiny | y |\n| another wide row here | y |";
+    let fixed = fix_converting(20, content);
+    assert_eq!(
+        fixed,
+        "- **H1**: fitting row here\n  - **H2**: y\n- **H1**: tiny\n  - **H2**: y\n- **H1**: another wide row here\n  - **H2**: y"
+    );
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_requires_content_rows() {
+    // A header and a delimiter carry no data to turn into items; converting
+    // would delete the table's only remaining information.
+    let content = "| Heading 1 | Heading 2 |\n| --------- | --------- |";
+    let fixed = fix_converting(12, content);
+    assert_eq!(fixed, "|Heading 1|Heading 2|\n|---------|---------|");
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_ignored_for_other_styles() {
+    // The option is documented as aligned-adaptive only; other styles keep
+    // their own early returns and never see the trigger.
+    let config = MD060Config {
+        style: "aligned".to_string(),
+        convert_wide_to_list: ConvertWideToList::Auto,
+        ..adaptive_config(20, false)
+    };
+    let rule = MD060TableFormat::from_config_struct(config, MD013Config::default(), true);
+    let ctx = LintContext::new(CONVERTIBLE_TABLE, MarkdownFlavor::Standard, None);
+    assert_eq!(rule.fix(&ctx).unwrap(), CONVERTIBLE_TABLE, "aligned ignores the option");
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_later_columns_are_siblings() {
+    // Columns after the first all hang at the first indentation level; they
+    // do not nest into each other.
+    let content = "| h1 | h2 | h3 | h4 |\n| --- | --- | --- | --- |\n\
+                   | val 1 | val 2 | val 3 | val 4 |\n| val 1 | val 2 | val 3 | val 4 |";
+    let fixed = fix_converting(10, content);
+    assert_eq!(
+        fixed,
+        "- **h1**: val 1\n  - **h2**: val 2\n  - **h3**: val 3\n  - **h4**: val 4\n\
+         - **h1**: val 1\n  - **h2**: val 2\n  - **h3**: val 3\n  - **h4**: val 4"
+    );
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_single_column_is_flat() {
+    let content = "| Header |\n| ------ |\n| value one |\n| value two |";
+    let fixed = fix_converting(8, content);
+    assert_eq!(fixed, "- **Header**: value one\n- **Header**: value two");
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_empty_cells_drop_their_separator() {
+    let content = "| Heading 1 | Heading 2 |\n| --------- | --------- |\n\
+                   | R1 val 1  |           |\n|           | R2 val 2  |";
+    let fixed = fix_converting(12, content);
+    assert_eq!(
+        fixed,
+        "- **Heading 1**: R1 val 1\n  - **Heading 2**:\n\
+         - **Heading 1**:\n  - **Heading 2**: R2 val 2"
+    );
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_check_rows_carry_the_conversion_fix() {
+    // The fix rewrites every line of the block, so every line reports; the
+    // message says what the fix will do rather than only width facts.
+    let rule = converting_rule(20);
+    let ctx = LintContext::new(CONVERTIBLE_TABLE, MarkdownFlavor::Standard, None);
+    let warnings = rule.check(&ctx).unwrap();
+    assert_eq!(warnings.len(), 4, "all four lines report: {warnings:?}");
+    for warning in &warnings {
+        assert!(
+            warning.message.ends_with(", convert to a list"),
+            "message names the conversion: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("max-width: 20"),
+            "message keeps the width fact: {}",
+            warning.message
+        );
+        assert!(warning.fix.is_some(), "every warning carries the conversion fix");
+    }
+    let replacements: Vec<&str> = warnings
+        .iter()
+        .map(|w| w.fix.as_ref().unwrap().replacement.as_str())
+        .collect();
+    assert!(
+        replacements.windows(2).all(|pair| pair[0] == pair[1]),
+        "one whole-block conversion shared by every warning"
+    );
+
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, CONVERTIBLE_EXPECTED);
+    let ctx = LintContext::new(&fixed, MarkdownFlavor::Standard, None);
+    assert!(
+        rule.check(&ctx).unwrap().is_empty(),
+        "converted content has no table left to report"
+    );
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_silent_header_and_delimiter_within_limit() {
+    // The header defines the geometry and cannot shrink, so no row fits it;
+    // the header's own line only reports the width fact it breaks, and the
+    // delimiter — which follows the header by construction — says nothing
+    // while it is within the limit.
+    let content = "| Wide Header Cell One | Wide Header Cell Two |\n| --- | --- |\n| a | b |";
+    let rule = converting_rule(30);
+    let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+    let warnings = rule.check(&ctx).unwrap();
+    let lines: Vec<usize> = warnings.iter().map(|w| w.line).collect();
+    assert_eq!(
+        lines,
+        vec![1, 3],
+        "header and content row report, delimiter stays silent: {warnings:?}"
+    );
+    assert_eq!(
+        warnings[0].message,
+        "Table too wide for aligned formatting (47 chars > max-width: 30), convert to a list"
+    );
+    assert_eq!(
+        warnings[1].message,
+        "Table columns cannot be aligned within max-width (30), convert to a list"
+    );
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_keeps_blockquote_prefix() {
+    let content = "> | Heading 1  | Heading 2 |\n> | ---------- | --------- |\n\
+                   > | R1 val 1   | R1 val 2  |\n> | R2 val 2   | R2 val 2  |";
+    let fixed = fix_converting(20, content);
+    assert_eq!(
+        fixed,
+        "> - **Heading 1**: R1 val 1\n>   - **Heading 2**: R1 val 2\n\
+         > - **Heading 1**: R2 val 2\n>   - **Heading 2**: R2 val 2"
+    );
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_reuses_the_marker_line() {
+    // The table starts on the bullet, so the converted block re-carries that
+    // marker with its own first line instead of wrapping a marker in a marker
+    // (`- - x`), which MD069 reads as a duplicate and collapses.
+    let content = "- | Heading 1  | Heading 2 |\n  | ---------- | --------- |\n  | R1 val 1   | R1 val 2  |\n  | R2 val 2   | R2 val 2  |";
+    let fixed = fix_converting(20, content);
+    assert_eq!(fixed, CONVERTIBLE_EXPECTED);
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_stays_inside_the_item_it_continues() {
+    // The table is a continuation of the item's content, so the converted
+    // block is indented under it rather than promoted beside it.
+    let content = "- item\n\n  | Heading 1  | Heading 2 |\n  | ---------- | --------- |\n  | R1 val 1   | R1 val 2  |\n  | R2 val 2   | R2 val 2  |";
+    let fixed = fix_converting(20, content);
+    assert_eq!(
+        fixed,
+        "- item\n\n  - **Heading 1**: R1 val 1\n    - **Heading 2**: R1 val 2\n  - **Heading 1**: R2 val 2\n    - **Heading 2**: R2 val 2"
+    );
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_is_idempotent() {
+    let fixed = fix_converting(20, CONVERTIBLE_TABLE);
+    assert_eq!(fix_converting(20, &fixed), fixed, "a second pass changes nothing");
+    let ctx = LintContext::new(&fixed, MarkdownFlavor::Standard, None);
+    assert!(converting_rule(20).check(&ctx).unwrap().is_empty());
+}
+
+#[test]
+fn test_md060_adaptive_ragged_rows_do_not_underflow() {
+    // Rows with fewer cells than the table has columns measure narrower than
+    // the geometry; sizing them used to subtract past zero and panic in debug
+    // builds (and over-compact in release). They must format instead.
+    let content = "| Column One | Column Two |\n| --- | --- |\n| short |\n| Another Long Row |\n| x |";
+    let rule = adaptive_rule(20, false);
+    let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(
+        fixed,
+        "|Column One|Column Two|\n|----------|----------|\n|short     |\n|Another Long Row|\n|x         |"
+    );
+    let ctx = LintContext::new(&fixed, MarkdownFlavor::Standard, None);
+    assert_eq!(rule.fix(&ctx).unwrap(), fixed, "ragged input formats idempotently");
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_leaves_tables_with_cellless_rows() {
+    // A pipe-less line the detector swept up parses as zero cells: it has no
+    // value to turn into an item, so it counts as alignable rather than
+    // towards the majority — one hopeless row of two stays a minority and the
+    // formatter applies exactly what it does with the option off.
+    let content = "| H1 | H2 |\n| --- | --- |\n| a very wide cell one | b |\nplain text row without pipes";
+    let expected = "|H1            |H2 |\n|--------------|---|\n|a very wide cell one|b|\n||";
+    assert_eq!(
+        fix_converting(20, content),
+        expected,
+        "a cellless row does not count as hopeless"
+    );
+
+    let rule = adaptive_rule(20, false);
+    let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+    assert_eq!(
+        rule.fix(&ctx).unwrap(),
+        expected,
+        "with the option off the same table formats identically"
+    );
+}
+
+#[test]
+fn test_md060_convert_wide_to_list_reflows_in_the_same_fmt_pass() {
+    // The conversion hands the coordinator a list whose lines are over the
+    // limit; MD013 must wrap them within the same `rumdl fmt` invocation, so
+    // one run leaves the file clean.
+    let input = "# Title\n\n\
+                 | Heading With A Very Long Name | Second Column Header |\n\
+                 | ----------------------------- | -------------------- |\n\
+                 | Some extremely long cell value that blows way past forty chars | Also a long second value here |\n\
+                 | Another extremely long cell value that blows past forty chars | Yet another long second value |";
+    let expected = "# Title\n\n\
+                    - **Heading With A Very Long Name**:\n\
+                    \x20 Some extremely long cell value that\n\
+                    \x20 blows way past forty chars\n\
+                    \x20 - **Second Column Header**: Also a\n\
+                    \x20   long second value here\n\
+                    - **Heading With A Very Long Name**:\n\
+                    \x20 Another extremely long cell value that\n\
+                    \x20 blows past forty chars\n\
+                    \x20 - **Second Column Header**: Yet\n\
+                    \x20   another long second value";
+
+    let mut md060_values = std::collections::BTreeMap::new();
+    md060_values.insert("enabled".to_string(), toml::Value::Boolean(true));
+    md060_values.insert("style".to_string(), toml::Value::String("aligned-adaptive".into()));
+    md060_values.insert("max-width".to_string(), toml::Value::Integer(40));
+    md060_values.insert("convert-wide-to-list".to_string(), toml::Value::String("auto".into()));
+
+    let mut md013_values = std::collections::BTreeMap::new();
+    md013_values.insert("enabled".to_string(), toml::Value::Boolean(true));
+    md013_values.insert("line-length".to_string(), toml::Value::Integer(40));
+    md013_values.insert("reflow".to_string(), toml::Value::Boolean(true));
+
+    let mut config = Config::default();
+    config.rules.insert(
+        "MD060".to_string(),
+        RuleConfig {
+            severity: None,
+            values: md060_values,
+        },
+    );
+    config.rules.insert(
+        "MD013".to_string(),
+        RuleConfig {
+            severity: None,
+            values: md013_values,
+        },
+    );
+
+    let rules: Vec<Box<dyn Rule>> = vec![
+        MD060TableFormat::from_config(&config),
+        MD013LineLength::from_config(&config),
+    ];
+
+    let coordinator = FixCoordinator::new();
+    let mut buf = input.to_string();
+    coordinator
+        .apply_fixes_iterative(&rules, &[], &mut buf, &config, 100, None)
+        .expect("fix coordinator must not error");
+    assert_eq!(buf, expected, "conversion and reflow settle in one fmt run");
+
+    // And the result is stable: a second run changes nothing.
+    coordinator
+        .apply_fixes_iterative(&rules, &[], &mut buf, &config, 100, None)
+        .expect("fix coordinator must not error");
+    assert_eq!(buf, expected, "second fmt run is a no-op");
 }

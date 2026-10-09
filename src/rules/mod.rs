@@ -132,6 +132,7 @@ pub use md056_table_column_count::MD056TableColumnCount;
 pub use md058_blanks_around_tables::MD058BlanksAroundTables;
 pub use md059_link_text::MD059LinkText;
 pub use md060_table_format::ColumnAlign;
+pub use md060_table_format::ConvertWideToList;
 pub use md060_table_format::MD060Config;
 pub use md060_table_format::MD060TableFormat;
 pub use md061_forbidden_terms::MD061ForbiddenTerms;

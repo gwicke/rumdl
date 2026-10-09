@@ -48,6 +48,45 @@ impl<'de> Deserialize<'de> for ColumnAlign {
     }
 }
 
+/// Controls conversion of tables that cannot stay aligned into lists.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ConvertWideToList {
+    /// Keep the table even when no row fits `max-width` (default).
+    #[default]
+    Disabled,
+    /// Convert a table to a nested list once a majority of content rows would
+    /// be forced out of alignment by right-to-left compaction.
+    Auto,
+}
+
+impl Serialize for ConvertWideToList {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            ConvertWideToList::Disabled => serializer.serialize_str("disabled"),
+            ConvertWideToList::Auto => serializer.serialize_str("auto"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ConvertWideToList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "disabled" => Ok(ConvertWideToList::Disabled),
+            "auto" => Ok(ConvertWideToList::Auto),
+            _ => Err(serde::de::Error::custom(format!(
+                "Invalid convert-wide-to-list value: {s}. Valid options: disabled, auto"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MD060Config {
     #[serde(default = "default_enabled")]
@@ -174,6 +213,29 @@ pub struct MD060Config {
     /// alias is accepted for cross-tool compatibility.
     #[serde(default, rename = "aligned-delimiter", alias = "aligned_delimiter")]
     pub aligned_delimiter: bool,
+
+    /// Controls whether tables that cannot stay aligned within `max-width`
+    /// are converted to nested lists instead.
+    ///
+    /// - `disabled` (default): keep the table; `aligned-adaptive` compacts it
+    ///   row by row even when rows then exceed `max-width`.
+    /// - `auto`: convert the table to a nested list once a majority of content
+    ///   rows would be forced out of alignment by right-to-left compaction,
+    ///   i.e. cannot remain aligned after the pad=0 drop. The header row
+    ///   labels the items (`- **Heading**: value`); remaining columns become
+    ///   siblings at the first indentation level.
+    ///
+    /// Only applies when `style = "aligned-adaptive"`.
+    ///
+    /// # Examples
+    ///
+    /// ```toml
+    /// [MD060]
+    /// style = "aligned-adaptive"
+    /// convert-wide-to-list = "auto"
+    /// ```
+    #[serde(default, rename = "convert-wide-to-list", alias = "convert_wide_to_list")]
+    pub convert_wide_to_list: ConvertWideToList,
 }
 
 impl Default for MD060Config {
@@ -187,6 +249,7 @@ impl Default for MD060Config {
             column_align_body: None,
             loose_last_column: false,
             aligned_delimiter: false,
+            convert_wide_to_list: ConvertWideToList::default(),
         }
     }
 }
@@ -275,5 +338,38 @@ mod tests {
         // markdownlint uses `aligned_delimiter` (snake_case). rumdl accepts both for compatibility.
         let cfg: MD060Config = toml::from_str("aligned_delimiter = true").unwrap();
         assert!(cfg.aligned_delimiter, "snake_case aligned_delimiter alias is accepted");
+    }
+
+    #[test]
+    fn test_convert_wide_to_list_defaults_to_disabled() {
+        let cfg: MD060Config = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.convert_wide_to_list,
+            ConvertWideToList::Disabled,
+            "convert-wide-to-list defaults to disabled"
+        );
+    }
+
+    #[test]
+    fn test_convert_wide_to_list_accepts_auto_and_snake_case_alias() {
+        let kebab: MD060Config = toml::from_str("convert-wide-to-list = \"auto\"").unwrap();
+        assert_eq!(kebab.convert_wide_to_list, ConvertWideToList::Auto);
+
+        let snake: MD060Config = toml::from_str("convert_wide_to_list = \"auto\"").unwrap();
+        assert_eq!(snake.convert_wide_to_list, ConvertWideToList::Auto);
+
+        let explicit: MD060Config = toml::from_str("convert-wide-to-list = \"disabled\"").unwrap();
+        assert_eq!(explicit.convert_wide_to_list, ConvertWideToList::Disabled);
+    }
+
+    #[test]
+    fn test_convert_wide_to_list_rejects_unknown_value() {
+        let err = toml::from_str::<MD060Config>("convert-wide-to-list = \"always\"").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("convert-wide-to-list"), "error names the option: {msg}");
+        assert!(
+            msg.contains("disabled") && msg.contains("auto"),
+            "error lists valid options: {msg}"
+        );
     }
 }
